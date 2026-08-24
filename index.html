@@ -1551,8 +1551,9 @@ const QUALITY={stage:0,dprMul:1};
 const STAGES=[{grid:420,dpr:1},{grid:340,dpr:0.85},{grid:280,dpr:0.75},{grid:230,dpr:0.65}];
 const cam={yaw:0.5,pitch:0.15,dist:4.1};
 /* 拖拽轨道旋转 + 惯性 + 滚轮缩放 */
-const dragState={on:false,moved:false,lx:0,ly:0,t0:0,yaw:0,pitch:0,vyaw:0,vpitch:0,cx:0,pinch0:0,zoom0:4.1,pinching:false};
-let zoomDist=4.1, zoomTarget=4.1;
+const dragState={on:false,moved:false,lx:0,ly:0,t0:0,yaw:0,pitch:0,vyaw:0,vpitch:0,cx:0,pinch0:0,zoom0:1.0,pinching:false};
+let zoomDist=1.0, zoomTarget=1.0;
+const REF_DIST=3.45;
 const mouse={nx:0,ny:0,on:false,down:false,
   ptr:[0,0,0],ptrT:[0,0,0],vel:[0,0,0],init:true};
 let waves=[];
@@ -1634,7 +1635,7 @@ function frame(now){
     QUALITY.dprMul*=0.9; lastDegrade=simTime; resize();
   }
 
-  /* 相机：自动微摆(±18°) + 手动拖拽轨道 + 惯性 + 滚轮缩放 + 呼吸推拉 */
+  /* 相机：乘法缩放模型——zoomTarget 为无量纲倍数，任何屏幕方向都有效 */
   if(!dragState.on){
     dragState.yaw+=dragState.vyaw*dt;
     dragState.pitch+=dragState.vpitch*dt;
@@ -1646,11 +1647,10 @@ function frame(now){
   cam.yaw   = Math.sin(simTime*0.08)*0.31 + dragState.yaw + mouse.nx*0.06;
   cam.pitch = Math.min(1.15,Math.max(-0.85,
               0.15 + Math.sin(simTime*0.071)*0.03 + dragState.pitch + mouse.ny*0.05));
+  const tanH=Math.tan(fov/2), aspNow=W/H;
+  const fitScale=Math.max(1.38/tanH/REF_DIST, 1.42/(tanH*aspNow)/REF_DIST, 1.0);
   zoomDist += (zoomTarget-zoomDist)*Math.min(1,dt*6);
-  /* 竖屏视野地板：保证心体宽度完整入画 */
-  const tanH=Math.tan(fov/2);
-  const fitDist=Math.max(1.38/tanH, 1.42/(tanH*(W/H)));
-  cam.dist=Math.max(zoomDist+env(E.breath,bt), fitDist);
+  cam.dist=Math.max(REF_DIST*fitScale*zoomDist + env(E.breath,bt), 1.9);
   const roll = Math.sin(simTime*0.05)*0.035;
   const camP=camPos();
   const fw=camFwd(camP), rt=camRight(fw), up0=camUp(rt,fw);
@@ -2116,7 +2116,7 @@ canvas.addEventListener('touchmove',e=>{
       e.touches[0].clientX-e.touches[1].clientX,
       e.touches[0].clientY-e.touches[1].clientY);
     if(dragState.pinch0>10){
-      zoomTarget=Math.min(6.5,Math.max(2.6,dragState.zoom0*dragState.pinch0/d));
+      zoomTarget=Math.min(2.0,Math.max(0.55,dragState.zoom0*dragState.pinch0/d));
     }
     return;
   }
@@ -2137,6 +2137,11 @@ canvas.addEventListener('touchmove',e=>{
 },{passive:false});
 window.addEventListener('touchend',e=>{
   mouse.down=false;
+  /* 全部手指离开：立即熄灭指针光球，避免残留 */
+  if(e.touches.length===0){
+    mouse.on=false;
+    mouse.ptr=[9,9,9]; mouse.vel=[0,0,0];
+  }
   /* 捏合结束后若还剩一根手指，重置拖拽基准防位置跳变 */
   if(dragState.pinching){
     dragState.pinching=false;
@@ -2156,7 +2161,11 @@ window.addEventListener('touchend',e=>{
     }
   }
 });
-window.addEventListener('pointercancel',()=>{ mouse.down=false; });
+window.addEventListener('pointercancel',()=>{
+  mouse.down=false;
+  mouse.on=false;
+  mouse.ptr=[9,9,9]; mouse.vel=[0,0,0];
+});
 canvas.addEventListener('webglcontextlost',e=>{
   e.preventDefault(); running=false;
   const el=document.querySelector('#err'); el.style.display='flex';
@@ -2169,7 +2178,7 @@ window.addEventListener('resize',()=>{
 });
 window.addEventListener('wheel',e=>{
   e.preventDefault();
-  zoomTarget=Math.min(6.5,Math.max(2.6,zoomTarget*Math.exp(e.deltaY*0.001)));
+  zoomTarget=Math.min(2.0,Math.max(0.55,zoomTarget*Math.exp(e.deltaY*0.001)));
 },{passive:false});
 document.addEventListener('visibilitychange',()=>{
   running=!document.hidden;
