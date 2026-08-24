@@ -8,6 +8,8 @@ A crimson energy heart made of 170,000 fluid particles, wrapped in rings of star
 
 ![WebGL2](https://img.shields.io/badge/API-WebGL2%20%7C%20GLSL%20ES%203.0-blue) ![Fluid](https://img.shields.io/badge/Solver-Navier--Stokes-purple) ![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen) ![File](https://img.shields.io/badge/package-single%20file-orange)
 
+**[▶ Live Demo](https://love.wuxinw.dpdns.org/)** (mirror: [GitHub Pages](https://wu-xing-ai.github.io/LOVE/))
+
 ---
 
 ## What Is This

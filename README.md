@@ -8,6 +8,8 @@
 
 ![WebGL2](https://img.shields.io/badge/API-WebGL2%20%7C%20GLSL%20ES%203.0-blue) ![Fluid](https://img.shields.io/badge/Solver-Navier--Stokes-purple) ![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen) ![File](https://img.shields.io/badge/package-single%20file-orange)
 
+**[▶ 在线体验 · Live Demo](https://love.wuxinw.dpdns.org/)** （备用：[GitHub Pages](https://wu-xing-ai.github.io/LOVE/)）
+
 ---
 
 ## 这是什么
