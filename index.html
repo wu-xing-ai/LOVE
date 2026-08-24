@@ -1551,7 +1551,7 @@ const QUALITY={stage:0,dprMul:1};
 const STAGES=[{grid:420,dpr:1},{grid:340,dpr:0.85},{grid:280,dpr:0.75},{grid:230,dpr:0.65}];
 const cam={yaw:0.5,pitch:0.15,dist:4.1};
 /* 拖拽轨道旋转 + 惯性 + 滚轮缩放 */
-const dragState={on:false,moved:false,lx:0,ly:0,t0:0,yaw:0,pitch:0,vyaw:0,vpitch:0,cx:0,pinch:0};
+const dragState={on:false,moved:false,lx:0,ly:0,t0:0,yaw:0,pitch:0,vyaw:0,vpitch:0,cx:0,pinch0:0,zoom0:4.1,pinching:false};
 let zoomDist=4.1, zoomTarget=4.1;
 const mouse={nx:0,ny:0,on:false,down:false,
   ptr:[0,0,0],ptrT:[0,0,0],vel:[0,0,0],init:true};
@@ -2097,25 +2097,30 @@ canvas.addEventListener('touchstart',e=>{
     dragState.cx=0; dragState.vyaw=0; dragState.vpitch=0;
     const pw=pointerWorld();
     mouse.ptrT=pw; mouse.vel=[0,0,0]; mouse.init=true;
-  } else if(e.touches.length===2){
-    dragState.on=false;
-    dragState.pinch=Math.hypot(
+  } else if(e.touches.length>=2){
+    /* 双指捏合：记录基准间距与基准距离，绝对映射不漂移 */
+    dragState.on=false; dragState.pinching=true;
+    dragState.pinch0=Math.hypot(
       e.touches[0].clientX-e.touches[1].clientX,
       e.touches[0].clientY-e.touches[1].clientY);
+    dragState.zoom0=zoomTarget;
+    mouse.down=false;
   }
   e.preventDefault();
 },{passive:false});
 canvas.addEventListener('touchmove',e=>{
   e.preventDefault();
-  if(e.touches.length===2){
-    /* 双指捏合缩放 */
+  if(e.touches.length>=2&&dragState.pinching){
+    /* 双指捏合：zoom = zoom0 × (初始间距/当前间距)，张开放大 */
     const d=Math.hypot(
       e.touches[0].clientX-e.touches[1].clientX,
       e.touches[0].clientY-e.touches[1].clientY);
-    if(dragState.pinch>10) zoomTarget=Math.min(6.5,Math.max(2.6,zoomTarget*dragState.pinch/d));
-    dragState.pinch=d;
+    if(dragState.pinch0>10){
+      zoomTarget=Math.min(6.5,Math.max(2.6,dragState.zoom0*dragState.pinch0/d));
+    }
     return;
   }
+  if(e.touches.length>=2) return;
   const t=e.touches[0];
   mouse.nx=(t.clientX/innerWidth)*2-1;
   mouse.ny=-((t.clientY/innerHeight)*2-1);
@@ -2132,6 +2137,17 @@ canvas.addEventListener('touchmove',e=>{
 },{passive:false});
 window.addEventListener('touchend',e=>{
   mouse.down=false;
+  /* 捏合结束后若还剩一根手指，重置拖拽基准防位置跳变 */
+  if(dragState.pinching){
+    dragState.pinching=false;
+    if(e.touches.length===1){
+      const t=e.changedTouches[0];
+      dragState.on=true; dragState.moved=true;   /* 不再触发 tap */
+      dragState.lx=t.clientX; dragState.ly=t.clientY;
+      dragState.cx=20; dragState.vyaw=0; dragState.vpitch=0;
+    }
+    return;
+  }
   if(dragState.on){
     dragState.on=false;
     if(!dragState.moved && performance.now()-dragState.t0<300){
