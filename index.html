@@ -6,8 +6,9 @@
 <title>心 · 光之生命体</title>
 <style>
   html,body{margin:0;padding:0;width:100%;height:100%;background:#020103;overflow:hidden;
+    overscroll-behavior:none;-webkit-tap-highlight-color:transparent;
     font-family:"Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;}
-  #gl{display:block;width:100vw;height:100vh;cursor:crosshair;touch-action:none;}
+  #gl{position:fixed;inset:0;width:100%;height:100%;display:block;cursor:crosshair;touch-action:none;}
   #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
     color:#ff7b8a;background:#05010a;font:14px/1.8 Consolas,monospace;text-align:center;padding:2em;z-index:9;}
 </style>
@@ -1646,7 +1647,10 @@ function frame(now){
   cam.pitch = Math.min(1.15,Math.max(-0.85,
               0.15 + Math.sin(simTime*0.071)*0.03 + dragState.pitch + mouse.ny*0.05));
   zoomDist += (zoomTarget-zoomDist)*Math.min(1,dt*6);
-  cam.dist  = zoomDist + env(E.breath,bt);
+  /* 竖屏视野地板：保证心体宽度完整入画 */
+  const tanH=Math.tan(fov/2);
+  const fitDist=Math.max(1.38/tanH, 1.42/(tanH*(W/H)));
+  cam.dist=Math.max(zoomDist+env(E.breath,bt), fitDist);
   const roll = Math.sin(simTime*0.05)*0.035;
   const camP=camPos();
   const fw=camFwd(camP), rt=camRight(fw), up0=camUp(rt,fw);
@@ -2049,7 +2053,8 @@ canvas.addEventListener('mousemove',e=>{
     const dx=e.clientX-dragState.lx, dy=e.clientY-dragState.ly;
     dragState.cx+=Math.abs(dx)+Math.abs(dy);
     if(dragState.cx>6) dragState.moved=true;
-    const instYaw=-dx*0.005, instPitch=dy*0.004;   /* 水平：场景跟手；垂直：俯仰已验证正确 */
+    const sens=0.005*Math.min(W,H)/800;   /* 小屏灵敏度降档 */
+    const instYaw=-dx*sens, instPitch=dy*sens*0.8;
     dragState.yaw+=instYaw;
     dragState.pitch=Math.min(1.15,Math.max(-0.85,dragState.pitch+instPitch));
     dragState.vyaw+=(instYaw/Math.max(gDt,1e-3)-dragState.vyaw)*0.25;
@@ -2119,8 +2124,9 @@ canvas.addEventListener('touchmove',e=>{
     const dx=t.clientX-dragState.lx, dy=t.clientY-dragState.ly;
     dragState.cx+=Math.abs(dx)+Math.abs(dy);
     if(dragState.cx>8) dragState.moved=true;
-    dragState.yaw-=dx*0.005;
-    dragState.pitch=Math.min(1.15,Math.max(-0.85,dragState.pitch+dy*0.004));
+    const tSens=0.005*Math.min(W,H)/800;
+    dragState.yaw-=dx*tSens;
+    dragState.pitch=Math.min(1.15,Math.max(-0.85,dragState.pitch+dy*tSens*0.8));
     dragState.lx=t.clientX; dragState.ly=t.clientY;
   }
 },{passive:false});
