@@ -1,0 +1,2164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>心 · 光之生命体</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;background:#020103;overflow:hidden;
+    font-family:"Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;}
+  #gl{display:block;width:100vw;height:100vh;cursor:crosshair;touch-action:none;}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+    color:#ff7b8a;background:#05010a;font:14px/1.8 Consolas,monospace;text-align:center;padding:2em;z-index:9;}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="err"></div>
+<script>
+"use strict";
+(()=>{
+
+/* ============================================================
+   心 · 光之生命体  v3 —— 真 3D 全息能量心
+   ────────────────────────────────────────────────────────────
+   流体层：欧拉网格 Navier-Stokes（图集式 44³ 体场）
+     平流 → 力注入(表面环流/心跳脉冲/鼠标搅动/心尖喷流) 
+     → 涡度约束 → 压力泊松×18 → 梯度相减
+   示踪层：17.6 万粒子由介质携带对流
+   骨架层：1.5 万粒子构成三维轮廓笼（CPU 牛顿投影烘焙到
+     Taubin 曲面）—— 主轮廓脊×2 / 纬线环×5 / 经线脊×6 / 表面尘，
+     前后景深减淡，心跳全程形状不失
+   渲染：HDR 累积残影 + 辉光链 + ACES + 色差折射
+   ============================================================ */
+
+const $ = s => document.querySelector(s);
+const canvas = $('#gl');
+function fatal(msg){ const e=$('#err'); e.style.display='flex'; e.textContent=msg; throw new Error(msg); }
+
+const gl = canvas.getContext('webgl2',{alpha:false,antialias:false,depth:false,stencil:false,
+  powerPreference:'high-performance',preserveDrawingBuffer:false});
+if(!gl) fatal('需要支持 WebGL2 的浏览器。');
+
+const EXT_FULL = gl.getExtension('EXT_color_buffer_float');
+const EXT_HALF = gl.getExtension('EXT_color_buffer_half_float');
+if(!EXT_FULL && !EXT_HALF) fatal('缺少浮点渲染扩展（EXT_color_buffer_float）。');
+const SIM_FMT  = EXT_FULL ? {internal:gl.RGBA32F, type:gl.FLOAT}
+                          : {internal:gl.RGBA16F, type:gl.FLOAT};
+const ACC_FMT  = {internal:gl.RGBA16F, type:gl.HALF_FLOAT};
+const GRID_FMT = {internal:gl.RGBA16F, type:gl.FLOAT};
+
+function sh(type,src){
+  const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){
+    console.error(gl.getShaderInfoLog(s), src.split('\n').map((l,i)=>(i+1)+': '+l).join('\n'));
+    fatal('着色器编译失败：'+gl.getShaderInfoLog(s));
+  } return s;
+}
+function prog(vs,fs){
+  const p=gl.createProgram();
+  gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));
+  gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) fatal('程序链接失败：'+gl.getProgramInfoLog(p));
+  const cache={};
+  p.u=function(n){ if(!(n in cache)) cache[n]=gl.getUniformLocation(this,n); return cache[n]; };
+  return p;
+}
+function makeTex(w,h,internal,type,filter,data){
+  const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D,0,internal,w,h,0,gl.RGBA,type,data||null);
+  return t;
+}
+function makeFBO(texs){
+  const f=gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER,f);
+  const atts=[];
+  texs.forEach((t,i)=>{ gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0+i,gl.TEXTURE_2D,t,0); atts.push(gl.COLOR_ATTACHMENT0+i); });
+  gl.drawBuffers(atts);
+  return f;
+}
+function persp(fovy,asp,n,f){ const t=1/Math.tan(fovy/2),o=new Float32Array(16);
+  o[0]=t/asp;o[5]=t;o[10]=(f+n)/(n-f);o[11]=-1;o[14]=2*f*n/(n-f); return o; }
+function lookAt(e,c,up){
+  let fx=c[0]-e[0],fy=c[1]-e[1],fz=c[2]-e[2]; let l=Math.hypot(fx,fy,fz);fx/=l;fy/=l;fz/=l;
+  let rx=fy*up[2]-fz*up[1], ry=fz*up[0]-fx*up[2], rz=fx*up[1]-fy*up[0];
+  l=Math.hypot(rx,ry,rz)||1;rx/=l;ry/=l;rz/=l;
+  const ux=ry*fz-rz*fy, uy=rz*fx-rx*fz, uz=rx*fy-ry*fx;
+  const o=new Float32Array(16);
+  o[0]=rx;o[4]=ry;o[8]=rz; o[1]=ux;o[5]=uy;o[9]=uz; o[2]=-fx;o[6]=-fy;o[10]=-fz;
+  o[12]=-(rx*e[0]+ry*e[1]+rz*e[2]); o[13]=-(ux*e[0]+uy*e[1]+uz*e[2]); o[14]=(fx*e[0]+fy*e[1]+fz*e[2]);
+  o[15]=1; return o;
+}
+function mul4(a,b){ const o=new Float32Array(16);
+  for(let c=0;c<4;c++)for(let r=0;r<4;r++){ let s=0;
+    for(let k=0;k<4;k++) s+=a[k*4+r]*b[c*4+k]; o[c*4+r]=s; } return o; }
+function tf(m,v){
+  return [m[0]*v[0]+m[4]*v[1]+m[8]*v[2]+m[12]*v[3],
+          m[1]*v[0]+m[5]*v[1]+m[9]*v[2]+m[13]*v[3],
+          m[2]*v[0]+m[6]*v[1]+m[10]*v[2]+m[14]*v[3],
+          m[3]*v[0]+m[7]*v[1]+m[11]*v[2]+m[15]*v[3]];
+}
+
+/* ============================================================ SHADERS */
+
+const NOISE = `
+vec3 mod289(vec3 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 mod289(vec4 x){return x-floor(x*(1.0/289.0))*289.0;}
+vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);}
+vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-0.85373472095314*r;}
+float snoise(vec3 v){
+  const vec2 C=vec2(1.0/6.0,1.0/3.0); const vec4 D=vec4(0.0,0.5,1.0,2.0);
+  vec3 i=floor(v+dot(v,C.yyy)); vec3 x0=v-i+dot(i,C.xxx);
+  vec3 g=step(x0.yzx,x0.xyz); vec3 l=1.0-g;
+  vec3 i1=min(g.xyz,l.zxy); vec3 i2=max(g.xyz,l.zxy);
+  vec3 x1=x0-i1+C.xxx; vec3 x2=x0-i2+C.yyy; vec3 x3=x0-D.yyy;
+  i=mod289(i);
+  vec4 p=permute(permute(permute(i.z+vec4(0.0,i1.z,i2.z,1.0))
+        +i.y+vec4(0.0,i1.y,i2.y,1.0))+i.x+vec4(0.0,i1.x,i2.x,1.0));
+  float n_=0.142857142857; vec3 ns=n_*D.wyz-D.xzx;
+  vec4 j=p-49.0*floor(p*ns.z*ns.z);
+  vec4 x_=floor(j*ns.z); vec4 y_=floor(j-7.0*x_);
+  vec4 x=x_*ns.x+ns.yyyy; vec4 y=y_*ns.x+ns.yyyy; vec4 h=1.0-abs(x)-abs(y);
+  vec4 b0=vec4(x.xy,y.xy); vec4 b1=vec4(x.zw,y.zw);
+  vec4 s0=floor(b0)*2.0+1.0; vec4 s1=floor(b1)*2.0+1.0; vec4 sh=-step(h,vec4(0.0));
+  vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy; vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+  vec3 p0=vec3(a0.xy,h.x); vec3 p1=vec3(a0.zw,h.y);
+  vec3 p2=vec3(a1.xy,h.z); vec3 p3=vec3(a1.zw,h.w);
+  vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+  p0*=norm.x;p1*=norm.y;p2*=norm.z;p3*=norm.w;
+  vec4 m=max(0.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.0); m=m*m;
+  return 42.0*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+}
+float hash11(float n){return fract(sin(n)*43758.5453123);}
+float hash21(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+`;
+
+/* 体场库（顶点安全版 + 片元格索引扩展） */
+const VOLCORE = `
+uniform int uGN;
+uniform int uGT;
+uniform float uHalf;
+ivec3 gClampC(ivec3 c){
+  return ivec3(clamp(c.x,0,uGN-1),clamp(c.y,0,uGN-1),clamp(c.z,0,uGN-1)); }
+vec4 gFetch(sampler2D t, ivec3 c){
+  c=gClampC(c);
+  int tx=(c.z%uGT)*uGN+c.x;
+  int ty=(c.z/uGT)*uGN+c.y;
+  return texelFetch(t,ivec2(tx,ty),0);
+}
+vec4 gFetchC(sampler2D t, ivec3 cc){ return gFetch(t,gClampC(cc)); }
+vec4 gSampleW(sampler2D t, vec3 wp){
+  vec3 cu=((wp/uHalf)*0.5+0.5)*(float(uGN)-1.0);
+  ivec3 c=ivec3(floor(cu));
+  vec3 w=cu-vec3(c);
+  vec4 s000=gFetch(t,c),            s100=gFetch(t,c+ivec3(1,0,0)),
+       s010=gFetch(t,c+ivec3(0,1,0)),s110=gFetch(t,c+ivec3(1,1,0)),
+       s001=gFetch(t,c+ivec3(0,0,1)),s101=gFetch(t,c+ivec3(1,0,1)),
+       s011=gFetch(t,c+ivec3(0,1,1)),s111=gFetch(t,c+ivec3(1,1,1));
+  return mix(mix(mix(s000,s100,w.x),mix(s010,s110,w.x),w.y),
+             mix(mix(s001,s101,w.x),mix(s011,s111,w.x),w.y),w.z);
+}
+`;
+const VOLFRAG = `
+ivec3 gCell(){
+  ivec2 pc=ivec2(gl_FragCoord.xy);
+  int cx=pc.x%uGN, cy=pc.y%uGN;
+  int tz=(pc.x/uGN)+(pc.y/uGN)*uGT;
+  return ivec3(cx,cy,tz);
+}
+vec3 gCellW(ivec3 c){
+  vec3 cuw=(vec3(c)+0.5)/float(uGN);
+  return (cuw*2.0-1.0)*uHalf;
+}
+`;
+
+const VS_FULLSCREEN = `#version 300 es
+layout(location=0) in vec2 aPos;
+out vec2 vUv;
+void main(){ vUv=aPos*0.5+0.5; gl_Position=vec4(aPos,0,1); }`;
+
+const HEARTFN = `
+float heartF(vec3 p){
+  vec3 q=vec3(p.x,p.z,p.y);
+  float a=q.x*q.x+2.25*q.y*q.y+q.z*q.z-1.0;
+  return a*a*a-q.x*q.x*q.z*q.z*q.z-0.1125*q.y*q.y*q.z*q.z*q.z;
+}
+vec3 heartG(vec3 p){
+  vec3 q=vec3(p.x,p.z,p.y);
+  float a=q.x*q.x+2.25*q.y*q.y+q.z*q.z-1.0;
+  float a2=a*a;
+  float gx=6.0*q.x*a2-2.0*q.x*q.z*q.z*q.z;
+  float gy=13.5*q.y*a2-0.225*q.y*q.z*q.z*q.z;
+  float gz=6.0*q.z*a2-3.0*q.x*q.x*q.z*q.z-0.3375*q.y*q.y*q.z*q.z;
+  return vec3(gx,gz,gy);
+}
+`;
+
+/* ---------- 流体网格 Passes ---------- */
+const FS_G_ADV = `#version 300 es
+precision highp float;
+${VOLCORE}${VOLFRAG}
+uniform sampler2D uSrc;
+uniform float uDt;
+out vec4 o;
+void main(){
+  ivec3 c=gCell();
+  vec3 vel=gFetch(uSrc,c).xyz;
+  vec3 wp=gCellW(c);
+  o=vec4(gSampleW(uSrc, wp-vel*uDt).xyz,0.0);
+}`;
+
+const FS_G_FORCE = `#version 300 es
+precision highp float;
+${NOISE}
+${HEARTFN}
+${VOLCORE}${VOLFRAG}
+uniform sampler2D uVel;
+uniform float uDt,uTime,uPulse,uSwirl,uScaleH,uJet,uTipY;
+uniform vec3 uPointer,uPtrVel,uCamDirG;
+uniform float uPtrOn,uPtrDown;
+out vec4 o;
+void main(){
+  ivec3 c=gCell();
+  vec3 v=gFetch(uVel,c).xyz;
+  vec3 wp=gCellW(c);
+
+  float Fs=heartF(wp/uScaleH);
+  vec3 n=normalize(heartG(wp/uScaleH)+vec3(1e-6));
+  float band=exp(-Fs*Fs*22.0);
+
+  /* 表面环流 */
+  vec3 t1=normalize(cross(n,vec3(0.13,1.0,0.07)));
+  vec3 t2=normalize(cross(n,t1));
+  float ph=snoise(wp*0.75+vec3(0.0,uTime*0.14,0.0))*3.14159;
+  vec3 sw=t1*cos(ph)+t2*sin(ph);
+  v+=sw*band*1.5*uDt;
+
+  /* 蓄能旋绕 */
+  {
+    vec3 d=wp-vec3(0.0,0.05,0.0);
+    vec3 tv=cross(vec3(0,1,0),d);
+    float lr=length(tv);
+    if(lr>1e-5){
+      float fall=exp(-abs(length(d)-0.95)*1.4);
+      v+=(tv/lr)*uSwirl*fall*1.6*uDt;
+    }
+  }
+
+  /* 软膜压 */
+  v+=-n*tanh(Fs*2.4)*band*2.1*uDt;
+
+  /* 心跳脉冲入流体 */
+  if(uPulse>0.001){
+    float r=length(wp);
+    v+=(wp/max(r,1e-3))*uPulse*exp(-r*1.4)*uDt*8.0;
+  }
+
+  /* 鼠标搅动 */
+  if(uPtrOn>0.5){
+    vec3 d=wp-uPointer;
+    float r2=dot(d,d);
+    float g=exp(-r2/0.42);
+    v+=uPtrVel*g*1.05*uDt;
+    v+=cross(normalize(d+vec3(1e-4)),uCamDirG)*g*((uPtrDown>0.5)?3.0:0.9)*uDt;
+  }
+
+  /* 微沸：内静边活 */
+  vec3 jp=wp*1.7;
+  vec3 j=vec3(snoise(jp+vec3(0.0,uTime*0.34,0.0)),
+              snoise(jp+vec3(31.7,uTime*0.31,7.1)),
+              snoise(jp+vec3(-11.3,5.5,uTime*0.27)));
+  v+=j*(0.35+0.65*band)*0.6*uDt;
+
+  /* 心尖双喷流 */
+  if(uJet>0.001){
+    vec3 td=wp-vec3(0.0,uTipY,0.0);
+    float tg=exp(-dot(td,td)/0.16);
+    float side=(wp.x>=0.0)?1.0:-1.0;
+    v+=normalize(vec3(side*0.85,-0.5,0.0))*tg*uJet*uDt*10.0;
+  }
+
+  o=vec4(v,0.0);
+}`;
+
+const FS_G_VORT = `#version 300 es
+precision highp float;
+${VOLCORE}${VOLFRAG}
+uniform sampler2D uVel;
+out vec4 o;
+void main(){
+  ivec3 c=gCell();
+  vec3 xb=gFetchC(uVel,c-ivec3(1,0,0)).xyz;
+  vec3 xf=gFetchC(uVel,c+ivec3(1,0,0)).xyz;
+  vec3 yd=gFetchC(uVel,c-ivec3(0,1,0)).xyz;
+  vec3 yu=gFetchC(uVel,c+ivec3(0,1,0)).xyz;
+  vec3 zb=gFetchC(uVel,c-ivec3(0,0,1)).xyz;
+  vec3 zf=gFetchC(uVel,c+ivec3(0,0,1)).xyz;
+  vec3 w=0.5*vec3(
+    (zf.y-zb.y)-(yu.z-yd.z),
+    (zf.x-zb.x)-(xf.x-xb.x),
+    (xf.y-xb.y)-(yu.x-yd.x));
+  o=vec4(w,length(w));
+}`;
+
+const FS_G_VCONF = `#version 300 es
+precision highp float;
+${VOLCORE}${VOLFRAG}
+uniform sampler2D uVel,uCurl;
+uniform float uDt,uEps,uCell;
+out vec4 o;
+void main(){
+  ivec3 c=gCell();
+  vec4 cw=gFetch(uCurl,c);
+  float xl=gFetchC(uCurl,c-ivec3(1,0,0)).w, xr=gFetchC(uCurl,c+ivec3(1,0,0)).w;
+  float yd=gFetchC(uCurl,c-ivec3(0,1,0)).w, yu=gFetchC(uCurl,c+ivec3(0,1,0)).w;
+  float zb=gFetchC(uCurl,c-ivec3(0,0,1)).w, zf=gFetchC(uCurl,c+ivec3(0,0,1)).w;
+  vec3 gr=0.5*vec3(xr-xl,yu-yd,zf-zb);
+  vec3 nz=gr/(length(gr)+1e-5);
+  vec3 fv=uEps*uCell*cross(nz,cw.xyz);
+  o=vec4(gFetch(uVel,c).xyz+fv*uDt,0.0);
+}`;
+
+const FS_G_DIV = `#version 300 es
+precision highp float;
+${VOLCORE}${VOLFRAG}
+uniform sampler2D uVel;
+out vec4 o;
+void main(){
+  ivec3 c=gCell();
+  float xl=gFetchC(uVel,c-ivec3(1,0,0)).x, xr=gFetchC(uVel,c+ivec3(1,0,0)).x;
+  float yd=gFetchC(uVel,c-ivec3(0,1,0)).y, yu=gFetchC(uVel,c+ivec3(0,1,0)).y;
+  float zb=gFetchC(uVel,c-ivec3(0,0,1)).z, zf=gFetchC(uVel,c+ivec3(0,0,1)).z;
+  o=vec4(0.5*((xr-xl)+(yu-yd)+(zf-zb)),0.0,0.0,0.0);
+}`;
+
+const FS_G_JACOBI = `#version 300 es
+precision highp float;
+${VOLCORE}${VOLFRAG}
+uniform sampler2D uPres,uDiv;
+out vec4 o;
+void main(){
+  ivec3 c=gCell();
+  float d=gFetch(uDiv,c).x;
+  float s=gFetchC(uPres,c-ivec3(1,0,0)).x+gFetchC(uPres,c+ivec3(1,0,0)).x
+         +gFetchC(uPres,c-ivec3(0,1,0)).x+gFetchC(uPres,c+ivec3(0,1,0)).x
+         +gFetchC(uPres,c-ivec3(0,0,1)).x+gFetchC(uPres,c+ivec3(0,0,1)).x;
+  o=vec4((s-d)/6.0,0.0,0.0,0.0);
+}`;
+
+const FS_G_SUB = `#version 300 es
+precision highp float;
+${VOLCORE}${VOLFRAG}
+uniform sampler2D uVel,uPres;
+out vec4 o;
+void main(){
+  ivec3 c=gCell();
+  vec3 v=gFetch(uVel,c).xyz;
+  float xl=gFetchC(uPres,c-ivec3(1,0,0)).x, xr=gFetchC(uPres,c+ivec3(1,0,0)).x;
+  float yd=gFetchC(uPres,c-ivec3(0,1,0)).x, yu=gFetchC(uPres,c+ivec3(0,1,0)).x;
+  float zb=gFetchC(uPres,c-ivec3(0,0,1)).x, zf=gFetchC(uPres,c+ivec3(0,0,1)).x;
+  v-=0.5*vec3(xr-xl,yu-yd,zf-zb);
+  vec3 cuv=(vec3(c)+0.5)/float(uGN);
+  float mx=max(abs(cuv.x-0.5),max(abs(cuv.y-0.5),abs(cuv.z-0.5)));
+  v*=smoothstep(0.5,0.43,mx);
+  o=vec4(v,0.0);
+}`;
+
+/* ---------- 粒子模拟：流体示踪 ---------- */
+const FS_SIM = `#version 300 es
+precision highp float; precision highp int;
+${NOISE}
+${HEARTFN}
+${VOLCORE}
+uniform sampler2D uPos;
+uniform sampler2D uVel;
+uniform sampler2D uGridVel;
+uniform float uDt, uTime, uSeedF;
+uniform float uAttract, uScale, uTurb;
+uniform float uBurst;
+uniform vec3  uPointer, uPointerVel, uCamDir;
+uniform float uPtrOn, uPtrDown, uEntrain;
+#define NW 5
+uniform vec4  uWaves[NW];
+uniform float uWaveAmp[NW];
+layout(location=0) out vec4 oPos;
+layout(location=1) out vec4 oVel;
+
+vec3 pot(vec3 p, float t){
+  float n1 = snoise(p*1.35+vec3(0.0,t*0.11,0.0))*0.72 + snoise(p*3.1+vec3(7.7,-t*0.17,3.1))*0.38;
+  float n2 = snoise(p*1.35+vec3(19.3,4.1,t*0.13))*0.72 + snoise(p*3.1+vec3(2.2,9.9,-t*0.19))*0.38;
+  float n3 = snoise(p*1.35+vec3(-4.7,t*0.09,13.0))*0.72 + snoise(p*3.1+vec3(11.5,-8.8,t*0.15))*0.38;
+  return vec3(n1,n2,n3);
+}
+vec3 curlN(vec3 p, float t){
+  const float e=0.12;
+  vec3 x0=pot(p,t), x1=pot(p+vec3(e,0,0),t), y1=pot(p+vec3(0,e,0),t), z1=pot(p+vec3(0,0,e),t);
+  return vec3(
+    (y1.z-x0.z)-(z1.y-x0.y),
+    (z1.x-x0.x)-(x1.z-x0.z),
+    (x1.y-x0.y)-(y1.x-x0.x))*(0.5/e);
+}
+
+void main(){
+  ivec2 tc=ivec2(gl_FragCoord.xy);
+  vec4 P=texelFetch(uPos,tc,0); vec4 V=texelFetch(uVel,tc,0);
+  vec3 p=P.xyz, v=V.xyz; float seed=P.w;
+  float dt=min(uDt,1.0/30.0);
+  vec3 a=vec3(0.0);
+
+  float Fm=heartF(p/uScale);
+  vec3 nm=normalize(heartG(p/uScale)+vec3(1e-6));
+  float surfM=exp(-Fm*Fm*40.0);
+
+  /* 流体耦合 */
+  vec3 vg=gSampleW(uGridVel, p).xyz;
+  v += (vg-v)*(1.0-exp(-7.5*dt));
+
+  /* 软膜记忆 */
+  a += -nm*tanh(Fm*2.3)*2.6*uAttract;
+
+  /* 亚格子微湍流 */
+  {
+    vec3 cn=curlN(p*1.6+seed*0.03, uTime);
+    cn-=nm*dot(cn,nm)*surfM*0.7;
+    a+=cn*0.55*(0.5+uTurb);
+  }
+
+  /* 鼠标近场 */
+  if(uPtrOn>0.5){
+    vec3 d=p-uPointer; float r=length(d);
+    float g=exp(-r*r/0.5);
+    v += (uPointerVel-v)*g*uEntrain*dt*5.0;
+    float sgn=(uPtrDown>0.5)?-2.6:0.4;
+    a += (d/max(r,0.18))*g*sgn*2.2;
+    a += cross(uCamDir,d)*g*((uPtrDown>0.5)?1.8:0.7);
+  }
+
+  /* 冲击波 */
+  for(int i=0;i<NW;i++){
+    float age=uWaves[i].w;
+    if(age>=0.0){
+      vec3 d=p-uWaves[i].xyz; float r=length(d);
+      float R=age*2.7;
+      float dd=(r-R)/0.36;
+      float band=exp(-dd*dd);
+      float amp=uWaveAmp[i]*exp(-age*1.7);
+      vec3 rd=d/max(r,0.001);
+      a += rd*band*amp*9.0;
+      a += cross(rd,vec3(0.3,0.9,0.2))*band*amp*2.2;
+    }
+  }
+
+  /* 爆发近场 */
+  if(uBurst>0.001){
+    float r=length(p);
+    a += (p/max(r,0.001))*uBurst*exp(-r/1.15)*0.55;
+  }
+
+  v += a*dt;
+  v *= exp(-2.6*dt);
+  float sp=length(v);
+  const float VMAX=3.9;
+  if(sp>VMAX){ v*=VMAX/sp; sp=VMAX; }
+
+  if(length(p)>6.5){
+    float h1=hash11(seed*97.0+uSeedF*13.1);
+    float h2=hash11(seed*57.5+uSeedF*71.7);
+    float h3=hash11(seed*31.7+uSeedF*29.3);
+    float zz=h1*2.0-1.0, an=h2*6.2831853, rr=sqrt(max(0.0,1.0-zz*zz));
+    p=vec3(rr*cos(an),zz,rr*sin(an))*(0.10+0.12*h3);
+    v=vec3(0.0); sp=0.0;
+  }
+
+  p += v*dt;
+  oPos=vec4(p,seed);
+  oVel=vec4(v,sp);
+}`;
+
+/* ============================================================
+   三维轮廓骨架（目标位置由 CPU 牛顿投影预烘焙到曲面）
+   kind: 0=主轮廓脊  1=纬线环  2=经线脊  3=表面尘
+   ============================================================ */
+const FS_SKEL_SIM = `#version 300 es
+precision highp float; precision highp int;
+${NOISE}
+uniform sampler2D uPos;
+uniform sampler2D uVel;
+uniform sampler2D uTgt;
+uniform sampler2D uTan;
+uniform float uDt,uTime,uScale,uCharge,uBurst,uReel;
+layout(location=0) out vec4 oP;
+layout(location=1) out vec4 oV;
+void main(){
+  ivec2 tc=ivec2(gl_FragCoord.xy);
+  vec4 P=texelFetch(uPos,tc,0);
+  vec4 V=texelFetch(uVel,tc,0);
+  vec3 p=P.xyz, v=V.xyz;
+  vec4 Tg=texelFetch(uTgt,tc,0);
+  vec4 Tm=texelFetch(uTan,tc,0);
+  float seed=P.w*61.7;
+  float dt=min(uDt,1.0/30.0);
+
+  float kindf=Tm.w;
+  float ph=(fract(kindf)-0.1)/0.8;
+  vec3 nrm=normalize(Tg.xyz+vec3(0.0,0.02,0.0));
+
+  float s=uScale*1.30;
+  vec3 target=Tg.xyz*s+vec3(0.0,0.05,0.0);
+
+  /* 沿预烘焙切向的呼吸滑移（分布永不漂移）*/
+  float glide=sin(uTime*(0.55+0.55*fract(ph))+ph*6.2831853);
+  float kf=floor(kindf+0.001);
+  float amp=(kf<0.5)?0.055:((kf<1.5)?0.045:((kf<2.5)?0.04:0.03));
+  target+=Tm.xyz*glide*amp*(1.0+0.7*uCharge);
+
+  /* 法向微振 */
+  float wig=snoise(vec3(seed*3.1,uTime*1.3,seed*5.7));
+  target+=nrm*wig*0.013;
+
+  /* 强弹簧钉住；爆发短暂外抛自动弹回 */
+  vec3 ac=(target-p)*62.0;
+  ac+=nrm*uBurst*34.0*(0.4+0.6*hash11(seed*3.7));
+  v+=ac*dt;
+  v*=exp(-mix(6.5,3.4,uReel)*dt);
+  float sp=length(v);
+  if(sp>3.2) v*=3.2/sp;
+  p+=v*dt;
+  oP=vec4(p,P.w);
+  oV=vec4(v,V.w);
+}`;
+
+const VS_SKEL = `#version 300 es
+precision highp float;
+layout(location=0) in float aIdx;
+uniform sampler2D uPos;
+uniform sampler2D uTgt;
+uniform sampler2D uTan;
+uniform mat4 uVP;
+uniform vec3 uCamPos;
+uniform int uN;
+uniform float uTime,uPtScale,uGlow;
+out vec4 vCol;
+void main(){
+  int i=int(aIdx+0.5);
+  ivec2 tc=ivec2(i%uN,i/uN);
+  vec4 P=texelFetch(uPos,tc,0);
+  vec4 Tg=texelFetch(uTgt,tc,0);
+  vec4 Tm=texelFetch(uTan,tc,0);
+  vec3 p=P.xyz;
+  float u=Tg.w;
+  float kindf=Tm.w;
+  float kf=floor(kindf+0.001);
+  gl_Position=uVP*vec4(p,1.0);
+  float zv=max(gl_Position.w,0.05);
+
+  /* 前后层次：背面更暗更虚略大；衰减曲线放缓，保住上缘弧线 */
+  vec3 toC=normalize(uCamPos-p);
+  float facing=dot(toC,normalize(p-vec3(0.0,0.05,0.0)));
+  float backAmt=1.0-smoothstep(-0.55,0.55,facing);
+
+  /* 特征增辉（仅主轮廓族）：σ 拓宽 + 上半部亮度地板 */
+  float dNotch=min(u,1.0-u);
+  float dTip=abs(u-0.5);
+  float a1=(u-0.21)/0.075, a2=(u-0.79)/0.075;
+  float feat=0.0;
+  if(kf<0.5){
+    feat=exp(-(dNotch*dNotch)/0.010)+exp(-(dTip*dTip)/0.006)
+        +exp(-a1*a1)+exp(-a2*a2);
+    feat=max(feat, smoothstep(0.30,0.05,dNotch)*0.85);
+  } else if(kf<2.5){ feat=0.35; }
+  feat=clamp(feat,0.0,1.9);
+  float upperAmt=smoothstep(0.30,0.05,dNotch);
+
+  float seed=P.w*61.7;
+  float flick=0.8+0.2*sin(uTime*(1.7+u*3.0)+seed*40.0);
+  float sz=uPtScale*0.5/zv*(1.1+feat*0.5)*(1.0+backAmt*0.6)*(1.0+upperAmt*0.15*step(kf,0.5));
+  gl_PointSize=clamp(sz,1.0,22.0);
+  vec3 col=mix(vec3(1.0,0.30,0.45),vec3(1.0,0.88,0.70),feat*0.6);
+  col=mix(col,vec3(0.75,0.55,1.0),backAmt*0.35);
+  float backFloor=(kf<0.5)?0.48:0.30;
+  float al=(0.52+0.48*flick)*(0.70+feat*0.40)*uGlow*mix(1.0,backFloor,backAmt);
+  vCol=vec4(col*(1.1+feat*0.9)*al,1.0);
+}`;
+const FS_SKEL_PTS = `#version 300 es
+precision highp float;
+in vec4 vCol;
+out vec4 oC;
+void main(){
+  vec2 d=gl_PointCoord-0.5;
+  float r2=dot(d,d)*4.0;
+  float fall=exp(-r2*2.6);
+  if(fall<0.01) discard;
+  oC=vec4(vCol.rgb*fall,1.0);
+}`;
+
+/* ---------- 主粒子点精灵（涡度致色 + 中轴暖芯）---------- */
+const VS_POINTS = `#version 300 es
+precision highp float;
+${NOISE}
+${HEARTFN}
+${VOLCORE}
+layout(location=0) in float aIdx;
+uniform sampler2D uPos;
+uniform sampler2D uVel;
+uniform sampler2D uGridCurl;
+uniform mat4 uVP;
+uniform vec3 uCamPos;
+uniform int uN;
+uniform float uTime, uFocus, uPtBase, uAspectTanInv, uHScale;
+out vec4 vCol;
+void main(){
+  int i=int(aIdx+0.5);
+  vec4 P=texelFetch(uPos,ivec2(i%uN,i/uN),0);
+  vec4 V=texelFetch(uVel,ivec2(i%uN,i/uN),0);
+  vec3 p=P.xyz, v=V.xyz; float seed=P.w; float sp=V.w;
+
+  vec4 vp=uVP*vec4(p,1.0);
+  gl_Position=vp;
+  float zv=max(vp.w,0.05);
+
+  float coc=abs(zv-uFocus)/uFocus;
+  float dof=1.0/(1.0+coc*coc*1.8);
+
+  vec3 toCam=normalize(uCamPos-p);
+  float dopp=dot(v,toCam)*0.30;
+
+  vec3 wv=gSampleW(uGridCurl,p).xyz;
+  float vort=clamp(length(wv)*1.35,0.0,1.0);
+
+  float flick=0.78+0.22*sin(uTime*(1.3+seed*2.1)+seed*41.0);
+  float Fs=heartF(p/uHScale);
+  float surfGlow=exp(-Fs*Fs*34.0);
+  /* 中轴暖芯：半透明体积的纵深眼神 */
+  float inside=smoothstep(0.05,-0.15,Fs);
+  float axisGlow=exp(-(p.x*p.x+p.z*p.z)*2.4)*inside;
+  float heat=clamp(0.16+sp*0.155+(1.15-length(p))*0.10+dopp+flick*0.10
+            +surfGlow*0.22+vort*0.18+axisGlow*0.14,0.0,1.5);
+
+  vec3 col=mix(vec3(0.52,0.015,0.075),vec3(1.00,0.10,0.235),smoothstep(0.0,0.58,heat));
+  col=mix(col,vec3(1.00,0.36,0.52),smoothstep(0.52,0.95,heat));
+  col=mix(col,vec3(1.00,0.86,0.62),smoothstep(0.92,1.35,heat));
+  col=mix(col,vec3(0.82,0.60,1.00),vort*0.38);
+
+  float sz=uPtBase*(0.55+seed*0.9)*(1.0+sp*0.22)*(1.0+coc*1.15)*uAspectTanInv*0.5/zv;
+  gl_PointSize=clamp(sz,1.0,64.0);
+
+  float al=(0.30+0.70*heat)*dof*flick*(0.30+0.70*smoothstep(-0.38,0.02,Fs))*0.85;
+  vCol=vec4(col*(0.55+heat*1.5),al);
+}`;
+const FS_POINTS = `#version 300 es
+precision highp float;
+in vec4 vCol;
+out vec4 oC;
+void main(){
+  vec2 d=gl_PointCoord-0.5;
+  float r2=dot(d,d)*4.0;
+  float fall=exp(-r2*3.2);
+  if(fall<0.006) discard;
+  oC=vec4(vCol.rgb*fall*vCol.a,1.0);
+}`;
+
+const VS_STREAK = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 aData;
+uniform sampler2D uPos;
+uniform sampler2D uVel;
+uniform mat4 uVP;
+uniform float uTime;
+uniform int uN;
+out float vA;
+out float vHeat;
+void main(){
+  int i=int(aData.x+0.5);
+  vec4 P=texelFetch(uPos,ivec2(i%uN,i/uN),0);
+  vec4 V=texelFetch(uVel,ivec2(i%uN,i/uN),0);
+  vec3 p=P.xyz, v=V.xyz; float sp=V.w; float seed=P.w;
+  float gate=smoothstep(1.35,2.7,sp)*(0.55+0.45*sin(uTime*3.0+seed*50.0));
+  float k=min(sp,3.4)*0.135;
+  vec3 q=p-normalize(v+vec3(1e-5))*k*step(0.5,aData.y);
+  gl_Position=uVP*vec4(q,1.0);
+  vA=gate*0.30;
+  vHeat=clamp(sp*0.30,0.0,1.2);
+}`;
+const FS_STREAK = `#version 300 es
+precision highp float;
+in float vA; in float vHeat;
+out vec4 oC;
+void main(){
+  if(vA<0.004) discard;
+  vec3 col=mix(vec3(1.0,0.14,0.25),vec3(1.0,0.75,0.55),vHeat);
+  oC=vec4(col*vA,1.0);
+}`;
+
+const VS_ARC = `#version 300 es
+precision highp float;
+${NOISE}
+layout(location=0) in vec2 aData;
+uniform sampler2D uPos;
+uniform mat4 uVP;
+uniform float uTime;
+uniform int uN;
+out float vA;
+void main(){
+  float fr=floor(uTime*24.0);
+  float h1=hash21(vec2(aData.x,fr));
+  float h2=hash21(vec2(aData.x*1.917+7.31,fr*1.37+11.7));
+  float h3=hash21(vec2(aData.x*0.773+3.1,fr+53.1));
+  int i0=int(h1*float(uN*uN-1));
+  int i1=int(h2*float(uN*uN-1));
+  vec3 p0=texelFetch(uPos,ivec2(i0%uN,i0/uN),0).xyz;
+  vec3 p1=texelFetch(uPos,ivec2(i1%uN,i1/uN),0).xyz;
+  float d=distance(p0,p1);
+  float gate=step(d,0.62)*step(0.55,h3);
+  vec3 q=mix(p0,p1,step(0.5,aData.y));
+  gl_Position=(gate>0.5)?uVP*vec4(q,1.0):vec4(9e4,9e4,9e4,1.0);
+  vA=gate*h3*h3*0.5*(1.0-d/0.62);
+}`;
+const FS_ARC = `#version 300 es
+precision highp float;
+in float vA; out vec4 oC;
+void main(){
+  if(vA<0.01) discard;
+  oC=vec4(vec3(0.82,0.74,1.0)*vA*1.6,1.0);
+}`;
+
+/* ============================================================
+   粒子银河：解析开普勒轨道 + 微扰状态 GPGPU
+   kind: 0=星尘 1=发光光球 2=拖尾粒子(线) 3=丝线成员(线)
+   ============================================================ */
+const GALCORE = `
+vec3 galOrbit(vec4 oa, vec4 ob, float thOff, float t, float spiralSeed, out float rr){
+  float a=oa.x;
+  /* 30% 螺旋呼吸：半径缓慢涨落 */
+  if(fract(spiralSeed*7.31)<0.30)
+    a*=1.0+0.045*sin(t*0.28+spiralSeed*6.2831853);
+  float e=oa.y;
+  float inc=oa.z;
+  float node=oa.w+ob.w*t*0.35;              /* 节点进动 */
+  float ph=ob.y+ob.x*t+thOff;
+  float peri=ob.z+ob.w*t*0.22;              /* 拱点进动 */
+  float r=a*(1.0-e*e)/(1.0+e*cos(ph-peri));
+  rr=r;
+  vec3 p=vec3(r*cos(ph),0.0,r*sin(ph));
+  float ci=cos(inc),si=sin(inc);
+  p=vec3(p.x,-p.z*si,p.z*ci);               /* 绕X倾斜 */
+  float cn=cos(node),sn=sin(node);
+  p=vec3(p.x*cn+p.z*sn,p.y,-p.x*sn+p.z*cn); /* 绕Y升交点 */
+  return p;
+}
+`;
+
+/* 银河模拟：微扰积分 + 能量相位偏移 */
+const FS_GAL_SIM = `#version 300 es
+precision highp float; precision highp int;
+${NOISE}
+${GALCORE}
+uniform sampler2D uOA,uOB,uOC;
+uniform sampler2D uPrevP,uPrevV;
+uniform float uDt,uTime,uEnergy,uScaleH;
+uniform vec3 uPointer,uCamDirG;
+uniform float uPtrOn,uPtrDown;
+#define NW 5
+uniform vec4 uWaves[NW];
+uniform float uWaveAmp[NW];
+layout(location=0) out vec4 oP;
+layout(location=1) out vec4 oV;
+void main(){
+  ivec2 tc=ivec2(gl_FragCoord.xy);
+  vec4 OA=texelFetch(uOA,tc,0);
+  vec4 OB=texelFetch(uOB,tc,0);
+  vec4 OC=texelFetch(uOC,tc,0);
+  vec4 Pp=texelFetch(uPrevP,tc,0);
+  vec4 Vv=texelFetch(uPrevV,tc,0);
+  vec3 disp=Pp.xyz; float thOff=Pp.w;
+  vec3 dvel=Vv.xyz; 
+  float dt=min(uDt,1.0/30.0);
+
+  float rr;
+  vec3 base=galOrbit(OA,OB,thOff,uTime,OC.z,rr);
+  float typef=OC.x;
+  float mass=(abs(typef-1.0)<0.5)?0.55:1.0;    /* 光球惯性大 */
+
+  vec3 F=vec3(0.0);
+  /* 心跳波前推动 */
+  for(int i=0;i<NW;i++){
+    float age=uWaves[i].w;
+    if(age>=0.0){
+      vec3 d=base-uWaves[i].xyz;
+      float r=length(d);
+      float R=age*2.7;
+      float dd=(r-R)/0.42;
+      float band=exp(-dd*dd);
+      float amp=uWaveAmp[i]*exp(-age*1.7);
+      F+=(d/max(r,0.001))*band*amp*3.4;
+    }
+  }
+  /* 鼠标弯轨 */
+  if(uPtrOn>0.5){
+    vec3 d=base-uPointer; float r2=dot(d,d);
+    float g=exp(-r2/0.9)*mass;
+    F+=d*g*(-(uPtrDown>0.5?2.8:0.7));                 /* 引/斥径向 */
+    F+=cross(uCamDirG,d)*g*((uPtrDown>0.5)?2.2:0.8);  /* 搅动涡旋 */
+  }
+  /* 回轨弹簧 + 阻尼 */
+  F+=-disp*3.4;
+  dvel+=F*dt*mass;
+  dvel*=exp(-1.7*dt);
+  float dv=length(dvel);
+  if(dv>1.6){dvel*=1.6/dv;}
+  disp+=dvel*dt;
+  float dl=length(disp);
+  if(dl>1.15){disp*=1.15/dl;}
+  /* 能量→角速度增幅（永久相位偏移，无跳变）*/
+  thOff+=(uEnergy-1.0)*OB.x*dt;
+
+  oP=vec4(disp,thOff);
+  oV=vec4(dvel,Vv.w);
+}`;
+
+/* 银河点精灵：星尘 / 光球 / 能量团 分型 */
+const VS_GAL_PTS = `#version 300 es
+precision highp float;
+${VOLCORE}
+${GALCORE}
+layout(location=0) in float aIdx;
+uniform sampler2D uOA,uOB,uOC,uGP;
+uniform mat4 uVP;
+uniform vec3 uCamPos;
+uniform int uN;
+uniform float uTime,uFocus,uAspectTanInv,uAspect,uCoreEnv,uEnergyTint;
+uniform vec3 uHeartScr;      /* ndc中心xy + ndc半径 */
+out vec4 vCol;
+void main(){
+  int i=int(aIdx+0.5);
+  ivec2 tc=ivec2(i%uN,i/uN);
+  vec4 OA=texelFetch(uOA,tc,0);
+  vec4 OB=texelFetch(uOB,tc,0);
+  vec4 OC=texelFetch(uOC,tc,0);
+  vec4 GP=texelFetch(uGP,tc,0);
+  float typef=OC.x, szS=OC.y, cs=OC.z;
+
+  float rr;
+  vec3 p=galOrbit(OA,OB,GP.w,uTime,cs,rr)+GP.xyz;
+
+  gl_Position=uVP*vec4(p,1.0);
+  float zv=max(gl_Position.w,0.05);
+  float coc=abs(zv-uFocus)/uFocus;
+  float dof=1.0/(1.0+coc*coc*1.6);
+
+  /* 伪遮挡：心后方且投影落在心形屏幕圆内 → 减淡 */
+  vec2 ndc=gl_Position.xy/zv;
+  float dx=(ndc.x-uHeartScr.x)*uAspect, dy=ndc.y-uHeartScr.y;
+  float dHeart=length(vec2(dx,dy));
+  bool behind=zv>uFocus;
+  float occ=(behind&&dHeart<uHeartScr.z*1.12)?mix(0.15,1.0,smoothstep(uHeartScr.z*0.5,uHeartScr.z*1.12,dHeart)):1.0;
+
+  float flick=0.75+0.25*sin(uTime*(1.1+szS*1.7)+szS*40.0);
+  float kf=floor(typef+0.001);
+  float wWorld=(kf<0.5)?0.010:((kf<1.5)?0.032:0.014);      /* 星尘/光球尺寸 */
+  float pulse=(kf>0.5&&kf<1.5)?(1.0+0.3*sin(uTime*2.2+szS*20.0)+uCoreEnv*0.35):1.0;
+  float sz=wWorld*(0.6+szS*0.8)*pulse*uAspectTanInv*0.5/zv;
+  gl_PointSize=clamp(sz,1.0,26.0);
+
+  vec3 col=mix(vec3(0.60,0.72,1.00),vec3(0.74,0.56,1.00),fract(cs*3.7));
+  col=mix(col,vec3(1.00,0.58,0.64),fract(cs*5.3)*0.6);
+  col=mix(col,vec3(1.00,0.85,0.60),uEnergyTint*0.45);       /* 爆发偏暖 */
+
+  float att=clamp(2.3/OA.x,0.35,1.0);                       /* 远轨暗淡 */
+  float baseA=(kf<0.5)?0.17:((kf<1.5)?0.38:0.26);
+  float al=baseA*dof*flick*att*occ*(0.8+uCoreEnv*0.3);
+  vCol=vec4(col*(0.7+att*0.8+uEnergyTint*0.6)*al,1.0);
+}`;
+const FS_GAL_PTS = `#version 300 es
+precision highp float;
+in vec4 vCol;
+out vec4 oC;
+void main(){
+  vec2 d=gl_PointCoord-0.5; float r2=dot(d,d)*4.0;
+  float fall=exp(-r2*2.8); if(fall<0.01) discard;
+  oC=vec4(vCol.rgb*fall,1.0);
+}`;
+
+/* 银河短拖尾：速度拉伸线段 */
+const VS_GAL_STREAK = `#version 300 es
+precision highp float;
+${GALCORE}
+layout(location=0) in vec2 aData;   /* idx, end */
+uniform sampler2D uOA,uOB,uOC,uGP;
+uniform mat4 uVP;
+uniform float uTime;
+uniform int uN;
+out float vA;
+out float vHeat;
+void main(){
+  int i=int(aData.x+0.5);
+  ivec2 tc=ivec2(i%uN,i/uN);
+  vec4 OA=texelFetch(uOA,tc,0);
+  vec4 OB=texelFetch(uOB,tc,0);
+  vec4 GP=texelFetch(uGP,tc,0);
+  float rr;
+  vec3 p =galOrbit(OA,OB,GP.w,uTime,      fract(OB.y*3.1),rr)+GP.xyz;
+  vec3 p2=galOrbit(OA,OB,GP.w,uTime-0.05, fract(OB.y*3.1),rr)+GP.xyz;
+  vec3 vel=(p-p2)/0.05;
+  float sp=length(vel);
+  vec3 q=p-normalize(vel+vec3(1e-5))*min(sp,2.2)*0.10*step(0.5,aData.y);
+  gl_Position=uVP*vec4(q,1.0);
+  float gate=smoothstep(0.85,1.8,sp);
+  vA=gate*0.13;
+  vHeat=clamp(sp*0.32,0.0,1.2);
+}`;
+
+/* 流体丝线：同轨道均布相位成员首尾相连 */
+const VS_GAL_FIL = `#version 300 es
+precision highp float;
+${GALCORE}
+layout(location=0) in vec3 aPair;   /* selfIdx, otherIdx, endFlag */
+uniform sampler2D uOA,uOB,uOC,uGP;
+uniform mat4 uVP;
+uniform int uN;
+uniform float uTime;
+out float vA;
+vec3 fetchPos(float nidx){
+  int i=int(nidx*float(uN*uN-1)+0.5);
+  ivec2 tc=ivec2(i%uN,i/uN);
+  vec4 OA=texelFetch(uOA,tc,0);
+  vec4 OB=texelFetch(uOB,tc,0);
+  vec4 GP=texelFetch(uGP,tc,0);
+  float rr;
+  return galOrbit(OA,OB,GP.w,uTime,0.5,rr)+GP.xyz;
+}
+void main(){
+  int si=int(aPair.x*float(uN*uN-1)+0.5);
+  float ka=texelFetch(uOC,ivec2(si%uN,si/uN),0).x;
+  vec3 pa=fetchPos(aPair.x);
+  vec3 pb=fetchPos(aPair.y);
+  float seg=distance(pa,pb);
+  vec3 pq=mix(pa,pb,aPair.z);            /* endFlag: A=0 / B=1 */
+  gl_Position=(ka>2.5&&seg<1.4)?uVP*vec4(pq,1.0):vec4(9e4,9e4,9e4,1.0);
+  vA=(ka>2.5)?(0.055+0.04*sin(uTime*2.0+aPair.x*40.0)):0.0;
+}
+`;
+const FS_GAL_FIL = `#version 300 es
+precision highp float;
+in float vA; out vec4 oC;
+void main(){
+  if(vA<0.01) discard;
+  oC=vec4(vec3(0.66,0.78,1.0)*vA*1.4,1.0);
+}`;
+
+const VS_BILL = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 aPos;
+uniform mat4 uVP;
+uniform vec3 uCenter;
+uniform vec2 uNdcR;
+out vec2 vUv;
+void main(){
+  vec4 c=uVP*vec4(uCenter,1.0);
+  c.xy/=max(c.w,1e-4);
+  c.xy+=aPos*uNdcR;
+  c.xy*=max(c.w,1e-4);
+  gl_Position=c;
+  vUv=aPos;
+}`;
+const FS_CORE = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform float uTime, uCore, uFlash;
+out vec4 oC;
+void main(){
+  float r=length(vUv);
+  if(r>1.0) discard;
+  float ang=atan(vUv.y,vUv.x);
+  float pulse=0.75+0.25*sin(uTime*2.1);
+  float core=exp(-r*r*22.0)*3.2 + exp(-r*4.5)*0.85;
+  float rays=pow(max(0.0,sin(ang*9.0+uTime*2.4)),4.0)*exp(-r*3.4)*0.68
+            +pow(max(0.0,sin(ang*17.0-uTime*1.7)),6.0)*exp(-r*5.0)*0.42;
+  float rings=pow(max(0.0,sin(r*20.0-uTime*7.0)),3.0)*exp(-r*3.8)*uFlash*1.35;
+  vec3 col=mix(vec3(1.0,0.83,0.55),vec3(1.0,0.25,0.38),smoothstep(0.0,0.75,r));
+  float I=(core*pulse+rays+rings)*(uCore+uFlash*1.8);
+  oC=vec4(col*I,1.0);
+}`;
+
+const FS_PTR = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform float uDown, uOn;
+out vec4 oC;
+void main(){
+  float r=length(vUv);
+  if(r>1.0) discard;
+  float rq=(r-0.78)*7.0;
+  float ring=exp(-rq*rq);
+  float haze=exp(-r*r*5.0)*0.25;
+  vec3 col=vec3(0.55,0.45,1.0);
+  float I=(ring*0.9+haze)*(uDown>0.5?1.6:0.55)*uOn;
+  oC=vec4(col*I,1.0);
+}`;
+
+const FS_FADE = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uPrev;
+uniform float uDecay;
+out vec4 oC;
+void main(){
+  vec3 c=texture(uPrev,vUv).rgb*uDecay-0.0007;
+  oC=vec4(max(c,vec3(0.0)),1.0);
+}`;
+
+const FS_BRIGHT = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uSrc;
+uniform vec2 uTexel;
+out vec4 oC;
+void main(){
+  vec3 c=vec3(0.0);
+  c+=texture(uSrc,vUv+uTexel*vec2(-1.0,-1.0)).rgb;
+  c+=texture(uSrc,vUv+uTexel*vec2( 1.0,-1.0)).rgb;
+  c+=texture(uSrc,vUv+uTexel*vec2(-1.0, 1.0)).rgb;
+  c+=texture(uSrc,vUv+uTexel*vec2( 1.0, 1.0)).rgb;
+  c*=0.25;
+  oC=vec4(max(c-vec3(0.72),vec3(0.0))*0.85,1.0);
+}`;
+
+const FS_BLUR = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uSrc;
+uniform vec2 uDir;
+out vec4 oC;
+void main(){
+  float w[5]=float[](0.227027,0.1945946,0.1216216,0.054054,0.016216);
+  vec3 c=texture(uSrc,vUv).rgb*w[0];
+  for(int i=1;i<5;i++){
+    c+=texture(uSrc,vUv+uDir*float(i)).rgb*w[i];
+    c+=texture(uSrc,vUv-uDir*float(i)).rgb*w[i];
+  }
+  oC=vec4(c,1.0);
+}`;
+
+const FS_COMP = `#version 300 es
+precision highp float;
+${NOISE}
+in vec2 vUv;
+uniform sampler2D uScene;
+uniform sampler2D uBloom;
+uniform float uTime, uAspect;
+#define NW 5
+uniform vec4 uWaveScr[NW];
+uniform float uFlash;
+out vec4 oC;
+
+vec3 aces(vec3 x){
+  return clamp(x*(2.51*x+0.03)/(x*(2.43*x+0.59)+0.14),0.0,1.0);
+}
+void main(){
+  vec2 uv=vUv;
+
+  vec2 refr=vec2(0.0);
+  for(int i=0;i<NW;i++){
+    float inten=uWaveScr[i].w;
+    if(inten>0.001){
+      vec2 d=uv-uWaveScr[i].xy;
+      d.x*=uAspect;
+      float rr=uWaveScr[i].z;
+      float q=dot(d,d)/(rr*rr+1e-6);
+      float qb=q-1.0;
+      float band=exp(-qb*qb*7.0);
+      refr-=normalize(d+vec2(1e-5))*band*inten*0.045;
+    }
+  }
+  uv+=refr;
+
+  float ca=0.0022+uFlash*0.012+length(refr)*0.30;
+  vec2 cd=(uv-0.5)*ca;
+  vec3 scn;
+  scn.r=texture(uScene,uv+cd).r;
+  scn.g=texture(uScene,uv).g;
+  scn.b=texture(uScene,uv-cd).b;
+
+  vec3 blm=texture(uBloom,uv-refr*0.5).rgb;
+
+  vec2 pc=(vUv-0.5)*vec2(uAspect,1.0);
+  float pr=length(pc);
+  vec3 bg=mix(vec3(0.012,0.002,0.022),vec3(0.004,0.001,0.010),smoothstep(0.0,0.9,pr));
+  bg+=vec3(0.30,0.02,0.07)*exp(-pr*pr*3.4)*0.55;
+  bg+=vec3(0.02,0.03,0.09)*exp(-pr*pr*0.9)*0.40;
+
+  vec3 col=bg+scn+blm*0.95;
+  col*=1.22;
+  col=aces(col);
+  col=pow(col,vec3(1.0/2.2));
+
+  col*=1.0-0.34*pow(pr*1.25,2.3);
+  col+=(hash21(vUv*913.7+fract(uTime)*57.0)-0.5)*0.028;
+
+  oC=vec4(col,1.0);
+}`;
+
+/* ============================================================ 几何与程序 */
+const QUAD = new Float32Array([-1,-1, 1,-1, -1,1, 1,-1, 1,1, -1,1]);
+const TRI  = new Float32Array([-1,-1, 3,-1, -1,3]);
+function makeBuf(data){ const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b);
+  gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW); return b; }
+function attrib(loc,buf,size){ gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,size,gl.FLOAT,false,0,0); }
+
+const bTri=makeBuf(TRI), bQuad=makeBuf(QUAD);
+
+const pSim   =prog(VS_FULLSCREEN,FS_SIM);
+const pAdv   =prog(VS_FULLSCREEN,FS_G_ADV);
+const pForce =prog(VS_FULLSCREEN,FS_G_FORCE);
+const pVort  =prog(VS_FULLSCREEN,FS_G_VORT);
+const pVconf =prog(VS_FULLSCREEN,FS_G_VCONF);
+const pDiv   =prog(VS_FULLSCREEN,FS_G_DIV);
+const pJac   =prog(VS_FULLSCREEN,FS_G_JACOBI);
+const pSub   =prog(VS_FULLSCREEN,FS_G_SUB);
+const pSkSim =prog(VS_FULLSCREEN,FS_SKEL_SIM);
+const pSkPts =prog(VS_SKEL,FS_SKEL_PTS);
+const pGalSim=prog(VS_FULLSCREEN,FS_GAL_SIM);
+const pGalPts=prog(VS_GAL_PTS,FS_GAL_PTS);
+const pGalStr=prog(VS_GAL_STREAK,FS_STREAK);
+const pGalFil=prog(VS_GAL_FIL,FS_GAL_FIL);
+const pPts   =prog(VS_POINTS,FS_POINTS);
+const pStreak=prog(VS_STREAK,FS_STREAK);
+const pArc   =prog(VS_ARC,FS_ARC);
+const pCore  =prog(VS_BILL,FS_CORE);
+const pPtr   =prog(VS_BILL,FS_PTR);
+const pFade  =prog(VS_FULLSCREEN,FS_FADE);
+const pBr    =prog(VS_FULLSCREEN,FS_BRIGHT);
+const pBlur  =prog(VS_FULLSCREEN,FS_BLUR);
+const pComp  =prog(VS_FULLSCREEN,FS_COMP);
+
+/* ============================================================ 粒子初始化 */
+function heartFjs(x,y,z){
+  const qx=x,qy=z,qz=y;
+  const a=qx*qx+2.25*qy*qy+qz*qz-1;
+  return a*a*a-qx*qx*qz*qz*qz-0.1125*qy*qy*qz*qz*qz;
+}
+function heartGjs(x,y,z){
+  const qx=x,qy=z,qz=y;
+  const a=qx*qx+2.25*qy*qy+qz*qz-1, a2=a*a;
+  return [6*qx*a2-2*qx*qz*qz*qz,
+          6*qz*a2-3*qx*qx*qz*qz-0.3375*qy*qy*qz*qz,
+          13.5*qy*a2-0.225*qy*qz*qz*qz];
+}
+let SIM_N=0, COUNT=0, bufIdx=null, simFlip=false;
+let texPosA=null,texVelA=null,texPosB=null,texVelB=null,fboSimA=null,fboSimB=null;
+function buildParticles(grid){
+  [texPosA,texVelA,texPosB,texVelB].forEach(t=>t&&gl.deleteTexture(t));
+  [fboSimA,fboSimB].forEach(f=>f&&gl.deleteFramebuffer(f));
+  SIM_N=grid; COUNT=grid*grid;
+  const pos=new Float32Array(COUNT*4), vel=new Float32Array(COUNT*4);
+  let placed=0;
+  while(placed<COUNT){
+    const z=2*Math.random()-1, an=Math.random()*Math.PI*2, rr=Math.cbrt(Math.random())*1.85;
+    const s=Math.sqrt(1-z*z);
+    const x=s*Math.cos(an)*rr, y=s*Math.sin(an)*rr, zz=z*rr;
+    const f=heartFjs(x,y,zz);
+    const surface=Math.abs(f)<0.11;
+    const deepInterior=f<-0.30;              /* 负空间壳隙：表皮下留暗带 */
+    if(!(surface||(deepInterior&&Math.random()<0.5))) continue;
+    const o=placed*4;
+    pos[o]=x; pos[o+1]=y; pos[o+2]=zz;
+    pos[o+3]=Math.random();
+    vel[o]=(Math.random()-0.5)*0.06; vel[o+1]=(Math.random()-0.5)*0.06; vel[o+2]=(Math.random()-0.5)*0.06;
+    vel[o+3]=0;
+    placed++;
+  }
+  texPosA=makeTex(SIM_N,SIM_N,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,pos);
+  texVelA=makeTex(SIM_N,SIM_N,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,vel);
+  texPosB=makeTex(SIM_N,SIM_N,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,pos);
+  texVelB=makeTex(SIM_N,SIM_N,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,vel);
+  fboSimA=makeFBO([texPosA,texVelA]);
+  fboSimB=makeFBO([texPosB,texVelB]);
+  const idx=new Float32Array(COUNT);
+  for(let i=0;i<COUNT;i++) idx[i]=i;
+  if(bufIdx) gl.deleteBuffer(bufIdx);
+  bufIdx=makeBuf(idx);
+}
+
+let STREAK_LINES=42000;
+const bufStreak=(()=>{ const a=new Float32Array(STREAK_LINES*2*2);
+  for(let i=0;i<STREAK_LINES;i++){ const o=i*4; a[o]=i;a[o+1]=0;a[o+2]=i;a[o+3]=1; }
+  return makeBuf(a); })();
+const ARC_SEGS=2400;
+const bufArc=(()=>{ const a=new Float32Array(ARC_SEGS*2*2);
+  for(let i=0;i<ARC_SEGS;i++){ const o=i*4; a[o]=i;a[o+1]=0;a[o+2]=i;a[o+3]=1; }
+  return makeBuf(a); })();
+
+/* ============================================================
+   三维轮廓骨架：CPU 求解 Taubin 截面 → 烘焙目标/切向纹理
+   ============================================================ */
+const SK_N=123, SK_COUNT=SK_N*SK_N;
+let skPosA=null,skVelA=null,skPosB=null,skVelB=null,fSkA=null,fSkB=null,skFlip=false;
+let skTgt=null,skTan=null,bufSkIdx=null;
+/* Taubin 隐式函数（世界坐标）用于截面求解 */
+function hF(x,y,z){
+  const qx=x,qy=z,qz=y;
+  const a=qx*qx+2.25*qy*qy+qz*qz-1;
+  return a*a*a-qx*qx*qz*qz*qz-0.1125*qy*qy*qz*qz*qz;
+}
+
+(function initSkel(){
+  /* ---- 截面半径表：secR[level][theta]，二分求 F(r·dir,y)=0 ---- */
+  const LV=88, TH=160;
+  const ys=new Float32Array(LV), RR=new Float32Array(LV*TH), valid=new Uint8Array(LV);
+  for(let li=0;li<LV;li++){
+    const y=-1.12+2.14*li/(LV-1);
+    ys[li]=y;
+    let sum=0;
+    for(let ti=0;ti<TH;ti++){
+      const th=ti/TH*Math.PI*2, ca=Math.cos(th), sa=Math.sin(th);
+      let lo=0, hi=1.4;
+      for(let k=0;k<22;k++){
+        const m=0.5*(lo+hi);
+        if(hF(m*ca,y,m*sa)<0) lo=m; else hi=m;
+      }
+      RR[li*TH+ti]=lo; sum+=lo;
+    }
+    valid[li]=sum/TH>0.14?1:0;
+  }
+  const lvValid=[];
+  for(let li=0;li<LV;li++) if(valid[li]) lvValid.push(li);
+
+  const P=(li,ti)=>{
+    const th=ti/TH*Math.PI*2, r=RR[li*TH+((ti%TH+TH)%TH)];
+    return [r*Math.cos(th), ys[li], r*Math.sin(th)];
+  };
+
+  const items=[];   /* {p,tn,u,kind} */
+
+  /* ---- 家族 0：主轮廓脊（正面剪影真解，含凹口 V 形内陷）---- */
+  {
+    /* 逐列求 y_top(x)/y_bot(x)：y 向扫描 + z 向存在性检测；余弦加密两端 */
+    const XN=150, YN=150, ZS=96;
+    const topPts=[], botPts=[];
+    for(let xi=0;xi<XN;xi++){
+      const a=xi/(XN-1)*(Math.PI/2);
+      const x=Math.sin(a)*1.35;                 // 0→xmax，凹口与外缘密
+      let top=null, bot=null;
+      for(let yi=0;yi<YN&&(top===null||bot===null);yi++){
+        const yT=1.34-yi*(2.48/(YN-1));         // 自上而下（顶界提到 1.34 抓全瓣尖）
+        const yB=-1.14+yi*(2.30/(YN-1));        // 自下而上
+        for(let zi=0;zi<ZS;zi++){
+          const z=-1.22+2.44*zi/(ZS-1);
+          if(top===null&&hF(x,yT,z)<0) top=[x,yT,z];
+          if(bot===null&&hF(x,yB,z)<0) bot=[x,yB,z];
+          if(top&&bot) break;
+        }
+      }
+      if(top)topPts.push(top);
+      if(bot)botPts.push(bot);
+    }
+    /* 牛顿投影精修：严格贴合 F=0 曲面 */
+    const proj=q=>{
+      for(let k=0;k<8;k++){
+        const g=heartGjs(q[0],q[1],q[2]);
+        const f=hF(q[0],q[1],q[2]);
+        const g2=g[0]*g[0]+g[1]*g[1]+g[2]*g[2];
+        q=[q[0]-g[0]*f/g2,q[1]-g[1]*f/g2,q[2]-g[2]*f/g2];
+      }
+      return q;
+    };
+    topPts.forEach(p=>{const r=proj(p);p[0]=r[0];p[1]=r[1];p[2]=r[2];});
+    botPts.forEach(p=>{const r=proj(p);p[0]=r[0];p[1]=r[1];p[2]=r[2];});
+    /* 右半闭环：凹口→右瓣→右侧→心尖；左半镜像反向拼接 */
+    const rightP=topPts.concat(botPts.slice().reverse());
+    rightP.forEach(p=>{if(p[0]<0)p[0]=0;});
+    const leftP=rightP.map(p=>[-p[0],p[1],p[2]]).reverse();
+    const loop=rightP.concat(leftP);              // 凹口(u0)→心尖(u0.5)→回凹口(u1)
+    /* 上半部密度倾斜：凹口附近粒子密度约翻倍 */
+    pushPolyline(loop, Math.floor(SK_COUNT*0.46), 0,{
+      weightFn:u=>{ const dn=Math.min(u,1-u);
+        return 0.55+1.2*Math.pow(1-Math.min(dn/0.32,1),2); }
+    });
+  }
+
+  function polyTangent(pts,i){
+    const a=pts[Math.max(0,i-1)], b=pts[Math.min(pts.length-1,i+1)];
+    let dx=b[0]-a[0],dy=b[1]-a[1],dz=b[2]-a[2];
+    const l=Math.hypot(dx,dy,dz)||1;
+    return [dx/l,dy/l,dz/l];
+  }
+  function pushPolyline(pts,count,kind,opt){
+    opt=opt||{};
+    /* 弧长表 */
+    const seg=[0];
+    for(let i=1;i<pts.length;i++)
+      seg.push(seg[i-1]+Math.hypot(pts[i][0]-pts[i-1][0],pts[i][1]-pts[i-1][1],pts[i][2]-pts[i-1][2]));
+    const total=seg[seg.length-1]||1;
+    const emitted=new Set();
+    for(let k=0;k<count;k++){
+      let u;
+      if(opt.weightFn){
+        let tries=0;
+        do{ u=Math.random(); tries++; }
+        while(Math.random()>opt.weightFn(u)&&tries<24);
+      } else u=Math.random();
+      if(opt.uMap) u=opt.uMap(u);
+      const target=u*total;
+      let i=1; while(i<seg.length&&seg[i]<target)i++;
+      const t=(target-seg[i-1])/Math.max(seg[i]-seg[i-1],1e-6);
+      const a=pts[i-1],b=pts[i];
+      const px=a[0]+(b[0]-a[0])*t, py=a[1]+(b[1]-a[1])*t, pz=a[2]+(b[2]-a[2])*t;
+      const tn=polyTangent(pts,i-1);
+      items.push({p:[px,py,pz], tn, u:(opt.uOf?opt.uOf(u,i):u), kind});
+    }
+  }
+
+  /* ---- 家族 1：纬线环 ×5 ---- */
+  {
+    const fr=[0.16,0.33,0.51,0.69,0.85];
+    for(const f of fr){
+      let li=lvValid[Math.round(f*(lvValid.length-1))];
+      const cnt=Math.floor(SK_COUNT*0.24/5);
+      const pts=[];
+      for(let ti=0;ti<TH;ti++) pts.push(P(li,ti));
+      pts.push(pts[0]);
+      pushPolyline(pts,cnt,1,{uMap:x=>x});
+    }
+  }
+
+  /* ---- 家族 2：经线脊 ×6 ---- */
+  {
+    for(let j=0;j<6;j++){
+      const phi=(j*60+10)*Math.PI/180;
+      const cp=Math.cos(phi), sp=Math.sin(phi);
+      const pts=[];
+      for(const li of lvValid){
+        /* 该方位角处取截面半径：找最近 θ */
+        const want=Math.atan2(sp,cp)>0?Math.atan2(sp,cp):Math.atan2(sp,cp)+Math.PI*2;
+        const ti=Math.round(want/(Math.PI*2)*TH)%TH;
+        const r=RR[li*TH+ti];
+        if(r>0.1) pts.push([r*Math.cos(want),ys[li],r*Math.sin(want)]);
+      }
+      if(pts.length<4) continue;
+      pushPolyline(pts,Math.floor(SK_COUNT*0.16/6),2,{uMap:x=>x});
+    }
+  }
+
+  /* ---- 家族 3：表面尘 ---- */
+  {
+    const cnt=Math.floor(SK_COUNT*0.14);
+    for(let k=0;k<cnt;k++){
+      const li=lvValid[Math.floor(Math.random()*lvValid.length)];
+      const ti=Math.floor(Math.random()*TH);
+      const p=P(li,ti);
+      const th=ti/TH*Math.PI*2;
+      items.push({p, tn:[-Math.sin(th),0,Math.cos(th)], u:Math.random(), kind:3});
+    }
+  }
+
+  /* ---- 上传纹理 ---- */
+  const tgt=new Float32Array(SK_COUNT*4), tan=new Float32Array(SK_COUNT*4);
+  const pos=new Float32Array(SK_COUNT*4), vel=new Float32Array(SK_COUNT*4);
+  for(let i=0;i<SK_COUNT;i++){
+    const it=items[i%items.length], o=i*4;
+    tgt[o]=it.p[0]; tgt[o+1]=it.p[1]; tgt[o+2]=it.p[2]; tgt[o+3]=it.u;
+    tan[o]=it.tn[0]; tan[o+1]=it.tn[1]; tan[o+2]=it.tn[2];
+    tan[o+3]=it.kind+0.1+0.8*Math.random();          /* 整数部分=kind，小数=相位 */
+    pos[o]=it.p[0]*1.30+(Math.random()-0.5)*0.05;
+    pos[o+1]=it.p[1]*1.30+0.05+(Math.random()-0.5)*0.05;
+    pos[o+2]=it.p[2]*1.30+(Math.random()-0.5)*0.05;
+    pos[o+3]=Math.random();
+    vel[o+3]=Math.random();
+  }
+  skTgt=makeTex(SK_N,SK_N,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,tgt);
+  skTan=makeTex(SK_N,SK_N,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,tan);
+  skPosA=makeTex(SK_N,SK_N,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,pos);
+  skVelA=makeTex(SK_N,SK_N,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,vel);
+  skPosB=makeTex(SK_N,SK_N,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,pos);
+  skVelB=makeTex(SK_N,SK_N,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,vel);
+  fSkA=makeFBO([skPosA,skVelA]);
+  fSkB=makeFBO([skPosB,skVelB]);
+  const idx=new Float32Array(SK_COUNT);
+  for(let i=0;i<SK_COUNT;i++)idx[i]=i;
+  bufSkIdx=makeBuf(idx);
+})();
+
+/* ============================================================
+   粒子银河资源：三层轨道 + 行星环带 + 椭圆深空轨 + 36 条流体丝线
+   ============================================================ */
+const GN2=108, GCOUNT=GN2*GN2;
+let gPosA=null,gPosB=null,gVelA=null,gVelB=null,fGP_A=null,fGP_B=null,fGV_A=null,fGV_B=null,gGalFlip=false;
+let gOA=null,gOB=null,gOC=null,bufGalIdx=null,bufGalFil=null;
+let GAL_TRAILS=0;
+(function initGalaxy(){
+  function rand(){return Math.random();}
+  const OA=new Float32Array(GCOUNT*4), OB=new Float32Array(GCOUNT*4), OC=new Float32Array(GCOUNT*4);
+  const P0=new Float32Array(GCOUNT*4), V0=new Float32Array(GCOUNT*4);
+  const K=1.6;
+  const ringA=[2.55,2.90,3.15,3.45], ringI=[0.07,-0.12,0.20,-0.24], ringN=[0.3,1.9,3.6,5.1];
+  for(let i=0;i<GCOUNT;i++){
+    const o=i*4;
+    const roll=Math.random();
+    let a,e,inc,node,peri,om,type;
+    if(i<GCOUNT*0.22){                        /* 近轨：稀疏，内缘外推 */
+      a=1.95+rand()*0.50; e=rand()*0.08;
+      inc=(rand()-0.5)*0.5; node=rand()*6.283; peri=rand()*6.283;
+      type=(roll<0.55)?0:((roll<0.75)?1:((roll<0.90)?2:0));
+      om=K/Math.pow(a,1.5);
+    } else if(i<GCOUNT*0.62){                /* 中轨：环带 + 一半全随机倾角 */
+      if(rand()<0.5){
+        const j=Math.floor(rand()*4);
+        a=ringA[j]+(rand()+rand()+rand()-1.5)*0.09;
+        e=0.04+rand()*0.12;
+        inc=ringI[j]+(rand()-0.5)*0.10;
+        node=ringN[j]+(rand()-0.5)*0.25;
+      } else {
+        a=2.4+rand()*1.3; e=0.05+rand()*0.15;
+        inc=Math.acos(1-2*rand());           /* 全随机倾角 */
+        node=rand()*6.283;
+      }
+      peri=rand()*6.283;
+      type=(roll<0.62)?0:((roll<0.77)?1:((roll<0.87)?2:0));
+      om=K/Math.pow(a,1.5);
+    } else {                                 /* 远轨：均匀球面包裹，360° */
+      a=3.6+rand()*2.8; e=0.25+rand()*0.30;
+      inc=Math.acos(1-2*rand());
+      node=rand()*6.283; peri=rand()*6.283;
+      type=(roll<0.78)?0:((roll<0.92)?1:2);
+      om=K/Math.pow(a,1.5)*0.85;
+    }
+    if(i<16*48){
+      type=3;
+      const fil=Math.floor(i/48)%16, mem=i%48;
+      a=1.9+(fil%18)*0.075+rand()*0.05;
+      e=0.03+rand()*0.10;
+      inc=(Math.floor(fil/18)-0.5)*0.55+(rand()-0.5)*0.08;
+      node=(fil%18)*0.1745+(rand()-0.5)*0.06;
+      peri=rand()*6.283;
+      om=K/Math.pow(a,1.5);
+      OA[o]=a; OA[o+1]=e; OA[o+2]=inc; OA[o+3]=node;
+      OB[o]=om; OB[o+1]=(mem/48)*6.283; OB[o+2]=peri; OB[o+3]=(rand()-0.5)*0.16;
+      OC[o]=3; OC[o+1]=rand(); OC[o+2]=rand();
+      OC[o+3]=(fil*48+((mem+1)%48))/(GCOUNT-1);
+      P0[o]=0;P0[o+1]=0;P0[o+2]=0;P0[o+3]=0;
+      V0[o]=0;V0[o+1]=0;V0[o+2]=0;V0[o+3]=rand()*6.283;
+      continue;
+    }
+    OA[o]=a; OA[o+1]=e; OA[o+2]=inc; OA[o+3]=node;
+    OB[o]=om; OB[o+1]=rand()*6.283; OB[o+2]=peri; OB[o+3]=(rand()-0.5)*0.16;
+    OC[o]=type; OC[o+1]=rand(); OC[o+2]=rand(); OC[o+3]=0;
+    P0[o]=0;P0[o+1]=0;P0[o+2]=0;P0[o+3]=0;
+    V0[o]=0;V0[o+1]=0;V0[o+2]=0;V0[o+3]=rand()*6.283;
+  }
+  gOA=makeTex(GN2,GN2,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,OA);
+  gOB=makeTex(GN2,GN2,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,OB);
+  gOC=makeTex(GN2,GN2,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,OC);
+  gPosA=makeTex(GN2,GN2,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,P0.slice());
+  gVelA=makeTex(GN2,GN2,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,V0.slice());
+  gPosB=makeTex(GN2,GN2,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,P0.slice());
+  gVelB=makeTex(GN2,GN2,SIM_FMT.internal,SIM_FMT.type,gl.NEAREST,V0.slice());
+  fGP_A=makeFBO([gPosA]); fGP_B=makeFBO([gPosB]);
+  fGV_A=makeFBO([gVelA]); fGV_B=makeFBO([gVelB]);
+  const idx=new Float32Array(GCOUNT);
+  for(let i=0;i<GCOUNT;i++)idx[i]=i;
+  bufGalIdx=makeBuf(idx);
+  const pairs=[];
+  for(let i=0;i<16*48;i++){
+    const nxt=Math.round(OC[i*4+3]*(GCOUNT-1));
+    pairs.push(i/(GCOUNT-1), nxt/(GCOUNT-1), 0);
+    pairs.push(nxt/(GCOUNT-1), i/(GCOUNT-1), 1);
+  }
+  GAL_TRAILS=pairs.length/3;
+  bufGalFil=makeBuf(new Float32Array(pairs));
+})();
+
+/* ============================================================ 流体网格资源 */
+const GN=44, GT=7, ATL=GN*GT, HALF=2.0;
+let gvA,gvB,gvS,gpA,gpB,gDiv,gCurl;
+let fGVA,fGVB,fGVS,fGPA,fGPB,fGDiv,fGCurl;
+let gFlip=false;
+(function initGrid(){
+  const zeros=new Float32Array(ATL*ATL*4);
+  gvA=makeTex(ATL,ATL,GRID_FMT.internal,GRID_FMT.type,gl.NEAREST,zeros.slice());
+  gvB=makeTex(ATL,ATL,GRID_FMT.internal,GRID_FMT.type,gl.NEAREST,zeros.slice());
+  gvS=makeTex(ATL,ATL,GRID_FMT.internal,GRID_FMT.type,gl.NEAREST,zeros.slice());
+  gpA=makeTex(ATL,ATL,GRID_FMT.internal,GRID_FMT.type,gl.NEAREST,zeros.slice());
+  gpB=makeTex(ATL,ATL,GRID_FMT.internal,GRID_FMT.type,gl.NEAREST,zeros.slice());
+  gDiv=makeTex(ATL,ATL,GRID_FMT.internal,GRID_FMT.type,gl.NEAREST,zeros.slice());
+  gCurl=makeTex(ATL,ATL,GRID_FMT.internal,GRID_FMT.type,gl.LINEAR,zeros.slice());
+  fGVA=makeFBO([gvA]); fGVB=makeFBO([gvB]); fGVS=makeFBO([gvS]);
+  fGPA=makeFBO([gpA]); fGPB=makeFBO([gpB]);
+  fGDiv=makeFBO([gDiv]); fGCurl=makeFBO([gCurl]);
+})();
+function gSetConsts(pr){
+  gl.uniform1i(pr.u('uGN'),GN);
+  gl.uniform1i(pr.u('uGT'),GT);
+  gl.uniform1f(pr.u('uHalf'),HALF);
+}
+
+/* ============================================================ 累积缓冲 */
+let W=0,H=0,DPR=1;
+let accA=null,accB=null,fboAccA=null,fboAccB=null,bloomA=null,bloomB=null,fboBA=null,fboBB=null;
+function buildTargets(){
+  [accA,accB,bloomA,bloomB].forEach(t=>t&&gl.deleteTexture(t));
+  [fboAccA,fboAccB,fboBA,fboBB].forEach(f=>f&&gl.deleteFramebuffer(f));
+  accA=makeTex(W,H,ACC_FMT.internal,ACC_FMT.type,gl.LINEAR);
+  accB=makeTex(W,H,ACC_FMT.internal,ACC_FMT.type,gl.LINEAR);
+  fboAccA=makeFBO([accA]); fboAccB=makeFBO([accB]);
+  const bw=Math.max(2,W>>2), bh=Math.max(2,H>>2);
+  bloomA=makeTex(bw,bh,ACC_FMT.internal,ACC_FMT.type,gl.LINEAR);
+  bloomB=makeTex(bw,bh,ACC_FMT.internal,ACC_FMT.type,gl.LINEAR);
+  fboBA=makeFBO([bloomA]); fboBB=makeFBO([bloomB]);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fboAccA);
+  gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fboAccB);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+}
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1,1.5)*QUALITY.dprMul;
+  W=Math.max(2,Math.round(innerWidth*DPR));
+  H=Math.max(2,Math.round(innerHeight*DPR));
+  canvas.width=W; canvas.height=H;
+  buildTargets();
+}
+
+/* ============================================================ 心跳包络 */
+const BEAT_T=4.2, BURST_AT=1.95;
+function env(keys,t){
+  if(t<=keys[0][0]) return keys[0][1];
+  for(let i=0;i<keys.length-1;i++){
+    const a=keys[i],b=keys[i+1];
+    if(t<b[0]){ let u=(t-a[0])/(b[0]-a[0]); u=u*u*(3-2*u); return a[1]+(b[1]-a[1])*u; }
+  }
+  return keys[keys.length-1][1];
+}
+const E={
+  attract:[[0,1.25],[0.7,1.4],[1.25,1.9],[1.92,3.2],[1.98,0.5],[2.55,0.55],[3.25,1.85],[3.85,1.5],[4.05,1.6],[4.2,1.25]],
+  scale:  [[0,1],[1.25,0.985],[1.95,0.93],[2.08,1.05],[2.9,1.01],[4.2,1]],
+  turb:   [[0,0.4],[1.25,0.28],[1.9,0.42],[2.02,1.6],[2.55,1.15],[3.3,0.5],[4.2,0.4]],
+  swirl:  [[0,0.25],[1.25,0.45],[1.9,2.0],[2.02,0.35],[2.9,0.22],[4.2,0.25]],
+  burst:  [[0,0],[1.92,0],[1.99,14],[2.14,3.0],[2.3,0]],
+  core:   [[0,0.5],[1.25,0.72],[1.9,1.7],[2.0,3.4],[2.5,1.0],[2.8,0.6],[4.2,0.5]],
+  breath: [[0,0],[1.25,-0.09],[1.95,-0.14],[2.06,0.12],[2.9,0.04],[4.2,0]],
+  charge: [[0,0],[1.22,0],[1.92,1],[2.04,0],[4.2,0]],
+  reel:   [[0,0],[2.95,0],[3.25,1],[3.8,0.35],[4.2,0]],
+  jet:    [[0,0],[1.95,0],[2.05,1.0],[2.65,0.5],[3.35,0.12],[4.2,0]],
+};
+
+/* ============================================================ 运行状态 */
+const QUALITY={stage:0,dprMul:1};
+const STAGES=[{grid:420,dpr:1},{grid:340,dpr:0.85},{grid:280,dpr:0.75},{grid:230,dpr:0.65}];
+const cam={yaw:0.5,pitch:0.15,dist:4.1};
+/* 拖拽轨道旋转 + 惯性 + 滚轮缩放 */
+const dragState={on:false,moved:false,lx:0,ly:0,t0:0,yaw:0,pitch:0,vyaw:0,vpitch:0,cx:0,pinch:0};
+let zoomDist=4.1, zoomTarget=4.1;
+const mouse={nx:0,ny:0,on:false,down:false,
+  ptr:[0,0,0],ptrT:[0,0,0],vel:[0,0,0],init:true};
+let waves=[];
+const MAXW=5;
+let flash=0, beatPrev=0, simTime=0, seedF=0;
+let fov=42*Math.PI/180;
+let fpsEma=60, lastDegrade=0;
+
+function spawnWave(c,amp){ waves.push({c:[c[0],c[1],c[2]],age:0,amp});
+  if(waves.length>MAXW) waves.shift(); }
+
+const add3=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]];
+const scl3=(a,s)=>[a[0]*s,a[1]*s,a[2]*s];
+const dot3=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const norm3=a=>{const l=Math.hypot(...a)||1;return[a[0]/l,a[1]/l,a[2]/l];};
+const sub3=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+function camPos(){ return [
+  Math.cos(cam.pitch)*Math.sin(cam.yaw)*cam.dist,
+  Math.sin(cam.pitch)*cam.dist+0.12,
+  Math.cos(cam.pitch)*Math.cos(cam.yaw)*cam.dist]; }
+function camFwd(cp){ return norm3(scl3(cp,-1)); }
+function camRight(fw){ return norm3([-fw[2],0,fw[0]]); }   /* 已修复镜像 */
+function camUp(rt,fw){ return norm3([
+  rt[1]*fw[2]-rt[2]*fw[1], rt[2]*fw[0]-rt[0]*fw[2], rt[0]*fw[1]-rt[1]*fw[0]]); }
+
+function pointerWorld(){
+  const asp=W/H, tanH=Math.tan(fov/2);
+  const cp=camPos(), fw=camFwd(cp), rt=camRight(fw), up=camUp(rt,fw);
+  const dx=mouse.nx*tanH*asp, dy=mouse.ny*tanH;
+  const rd=norm3(add3(add3(fw,scl3(rt,dx)),scl3(up,dy)));
+  const denom=dot3(rd,fw);
+  return add3(cp,scl3(rd,(-dot3(cp,fw))/(denom!==0?denom:1e-6)));
+}
+function updatePointer(){
+  if(!mouse.on){ mouse.ptrT=[9,9,9]; }
+  else mouse.ptrT=pointerWorld();
+  if(mouse.ptr[0]===0&&mouse.ptr[1]===0&&mouse.ptr[2]===0&&!mouse.on){}
+  if(!mouse.init){ mouse.ptr=[...mouse.ptrT]; mouse.init=true; }
+  const inv=1/Math.max(gDt,1e-3);
+  for(let i=0;i<3;i++){
+    const inst=(mouse.ptrT[i]-mouse.ptr[i])*inv;
+    mouse.vel[i]+=(inst-mouse.vel[i])*0.35;
+    mouse.ptr[i]+=(mouse.ptrT[i]-mouse.ptr[i])*0.5;   /* 更跟手 */
+  }
+  const vl=Math.hypot(...mouse.vel);
+  if(vl>6) mouse.vel=scl3(mouse.vel,6/vl);
+}
+
+/* ============================================================ 帧循环 */
+const waveArr=new Float32Array(MAXW*4), ampArr=new Float32Array(MAXW);
+const waveScr=new Float32Array(MAXW*4);
+let prevT=performance.now(), running=true, accFlip=false, gDt=1/60;
+const JACOBI_ITERS=18;
+
+function drawPass(pr,fbo,w,h){
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.viewport(0,0,w,h);
+  attrib(0,bTri,2);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+}
+function fboOf(tex){
+  if(tex===gvA)return fGVA; if(tex===gvB)return fGVB;
+  return fGVS;
+}
+
+function frame(now){
+  if(!running){ prevT=now; requestAnimationFrame(frame); return; }
+  let dt=(now-prevT)/1000; prevT=now;
+  dt=Math.min(dt,1/20);
+  gDt=dt;
+  simTime+=dt; seedF=(seedF+1)%1000;
+
+  fpsEma+= (1/Math.max(dt,1e-4)-fpsEma)*0.04;
+  if(fpsEma<44 && simTime-lastDegrade>4 && QUALITY.stage<STAGES.length-1){
+    QUALITY.stage++; lastDegrade=simTime;
+    const st=STAGES[QUALITY.stage];
+    QUALITY.dprMul=st.dpr; buildParticles(st.grid); resize();
+  } else if(fpsEma<47 && QUALITY.stage===STAGES.length-1 && DPR>0.6 && simTime-lastDegrade>2){
+    QUALITY.dprMul*=0.9; lastDegrade=simTime; resize();
+  }
+
+  /* 相机：自动微摆(±18°) + 手动拖拽轨道 + 惯性 + 滚轮缩放 + 呼吸推拉 */
+  if(!dragState.on){
+    dragState.yaw+=dragState.vyaw*dt;
+    dragState.pitch+=dragState.vpitch*dt;
+    dragState.vyaw*=Math.exp(-2.5*dt);
+    dragState.vpitch*=Math.exp(-2.5*dt);
+  }
+  dragState.pitch=Math.min(1.15,Math.max(-0.85,dragState.pitch));
+  const bt=simTime%BEAT_T;
+  cam.yaw   = Math.sin(simTime*0.08)*0.31 + dragState.yaw + mouse.nx*0.06;
+  cam.pitch = Math.min(1.15,Math.max(-0.85,
+              0.15 + Math.sin(simTime*0.071)*0.03 + dragState.pitch + mouse.ny*0.05));
+  zoomDist += (zoomTarget-zoomDist)*Math.min(1,dt*6);
+  cam.dist  = zoomDist + env(E.breath,bt);
+  const roll = Math.sin(simTime*0.05)*0.035;
+  const camP=camPos();
+  const fw=camFwd(camP), rt=camRight(fw), up0=camUp(rt,fw);
+  const up=[Math.sin(roll)*up0[2]+Math.cos(roll)*up0[1],
+            Math.cos(roll)*up0[1]-Math.sin(roll)*up0[2]*0,
+            0];   /* 简化：roll 只在 XY 内旋转 up 的近似 */
+  up[0]=up0[0]*Math.cos(roll)+up0[2]*Math.sin(roll);
+  up[2]=-up0[0]*Math.sin(roll)+up0[2]*Math.cos(roll);
+  up[1]=up0[1];
+  const view=lookAt(camP,[0,0,0],up);
+  const proj=persp(fov,W/H,0.1,60);
+  const VP=mul4(proj,view);
+  const focalY=1/Math.tan(fov/2);
+
+  updatePointer();
+
+  if(beatPrev<BURST_AT && bt>=BURST_AT){
+    spawnWave([0,0.05,0],1.7);
+    flash=Math.min(flash+0.9,1.6);
+  }
+  beatPrev=bt;
+  flash*=Math.exp(-dt*3.2);
+
+  waves.forEach(w=>w.age+=dt);
+  waves=waves.filter(w=>w.age<1.9);
+  waveArr.fill(-1); ampArr.fill(0); waveScr.fill(0);
+  waves.forEach((w,i)=>{
+    waveArr[i*4]=w.c[0];waveArr[i*4+1]=w.c[1];waveArr[i*4+2]=w.c[2];waveArr[i*4+3]=w.age;
+    ampArr[i]=w.amp;
+    const cl=tf(VP,[...w.c,1]);
+    if(cl[3]>0.01){
+      const nx=cl[0]/cl[3], ny=cl[1]/cl[3];
+      const dist=Math.hypot(...sub3(w.c,camP));
+      const rNdc=w.age*2.7*focalY/dist;
+      waveScr[i*4]=nx*0.5+0.5; waveScr[i*4+1]=ny*0.5+0.5;
+      waveScr[i*4+2]=rNdc*0.5; waveScr[i*4+3]=w.amp*Math.exp(-w.age*1.4);
+    }
+  });
+
+  const hScale=env(E.scale,bt);
+  const burstV=env(E.burst,bt);
+  const chargeAmt=env(E.charge,bt);
+  const reelAmt=env(E.reel,bt);
+  const jetV=env(E.jet,bt);
+  const burstK=Math.min(burstV/14,1);
+
+  gl.disable(gl.BLEND);
+
+  /* ================= 流体网格 ================= */
+  const rV=gFlip?gvB:gvA, wV=gFlip?gvA:gvB;
+  const rP=gFlip?gpB:gpA, wP=gFlip?gpA:gpB;
+
+  gl.useProgram(pAdv); gSetConsts(pAdv);
+  gl.uniform1i(pAdv.u('uSrc'),0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,rV);
+  gl.uniform1f(pAdv.u('uDt'),dt);
+  drawPass(pAdv,fGVS,ATL,ATL);
+
+  gl.useProgram(pForce); gSetConsts(pForce);
+  gl.uniform1i(pForce.u('uVel'),0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gvS);
+  gl.uniform1f(pForce.u('uDt'),dt);
+  gl.uniform1f(pForce.u('uTime'),simTime);
+  gl.uniform1f(pForce.u('uPulse'),burstV*0.55);
+  gl.uniform1f(pForce.u('uSwirl'),env(E.swirl,bt));
+  gl.uniform1f(pForce.u('uScaleH'),hScale);
+  gl.uniform1f(pForce.u('uJet'),jetV);
+  gl.uniform1f(pForce.u('uTipY'),-1.16*hScale);
+  gl.uniform3fv(pForce.u('uPointer'),mouse.on?mouse.ptr:[9,9,9]);
+  gl.uniform3fv(pForce.u('uPtrVel'),mouse.vel);
+  gl.uniform3fv(pForce.u('uCamDirG'),fw);
+  gl.uniform1f(pForce.u('uPtrOn'),mouse.on?1:0);
+  gl.uniform1f(pForce.u('uPtrDown'),mouse.down?1:0);
+  drawPass(pForce,fboOf(wV),ATL,ATL);
+
+  gl.useProgram(pVort); gSetConsts(pVort);
+  gl.uniform1i(pVort.u('uVel'),0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,wV);
+  drawPass(pVort,fGCurl,ATL,ATL);
+
+  gl.useProgram(pVconf); gSetConsts(pVconf);
+  gl.uniform1i(pVconf.u('uVel'),0); gl.uniform1i(pVconf.u('uCurl'),1);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,wV);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gCurl);
+  gl.uniform1f(pVconf.u('uDt'),dt);
+  gl.uniform1f(pVconf.u('uEps'),12.0);
+  gl.uniform1f(pVconf.u('uCell'),2*HALF/GN);
+  drawPass(pVconf,fGVS,ATL,ATL);
+
+  gl.useProgram(pDiv); gSetConsts(pDiv);
+  gl.uniform1i(pDiv.u('uVel'),0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gvS);
+  drawPass(pDiv,fGDiv,ATL,ATL);
+
+  gl.useProgram(pJac); gSetConsts(pJac);
+  gl.uniform1i(pJac.u('uDiv'),0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gDiv);
+  let srcP=rP, dstP=wP;
+  for(let it=0;it<JACOBI_ITERS;it++){
+    gl.uniform1i(pJac.u('uPres'),1);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,srcP);
+    drawPass(pJac,(dstP===gpA)?fGPA:fGPB,ATL,ATL);
+    const t=srcP; srcP=dstP; dstP=t;
+  }
+
+  gl.useProgram(pSub); gSetConsts(pSub);
+  gl.uniform1i(pSub.u('uVel'),0); gl.uniform1i(pSub.u('uPres'),1);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gvS);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,srcP);
+  drawPass(pSub,fboOf(wV),ATL,ATL);
+
+  gFlip=!gFlip;
+
+  /* ================= 粒子银河模拟 ================= */
+  {
+    const wP2=gGalFlip?fGP_A:fGP_B, rP2=gGalFlip?gPosB:gPosA;
+    const wV2=gGalFlip?fGV_A:fGV_B, rV2=gGalFlip?gVelB:gVelA;
+    gl.bindFramebuffer(gl.FRAMEBUFFER,wP2);
+    gl.viewport(0,0,GN2,GN2);
+    gl.useProgram(pGalSim); gSetConsts(pGalSim);
+    gl.uniform1i(pGalSim.u('uOA'),0); gl.uniform1i(pGalSim.u('uOB'),1);
+    gl.uniform1i(pGalSim.u('uOC'),2); gl.uniform1i(pGalSim.u('uPrevP'),3);
+    gl.uniform1i(pGalSim.u('uPrevV'),4);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gOA);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gOB);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,gOC);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D,rP2);
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D,rV2);
+    gl.uniform1f(pGalSim.u('uDt'),dt);
+    gl.uniform1f(pGalSim.u('uTime'),simTime);
+    gl.uniform1f(pGalSim.u('uEnergy'),1.0+env(E.core,bt)*0.35+burstK*1.2);
+    gl.uniform1f(pGalSim.u('uScaleH'),hScale);
+    gl.uniform3fv(pGalSim.u('uPointer'),mouse.on?mouse.ptr:[9,9,9]);
+    gl.uniform3fv(pGalSim.u('uCamDirG'),fw);
+    gl.uniform1f(pGalSim.u('uPtrOn'),mouse.on?1:0);
+    gl.uniform1f(pGalSim.u('uPtrDown'),mouse.down?1:0);
+    gl.uniform4fv(pGalSim.u('uWaves[0]'),waveArr);
+    gl.uniform1fv(pGalSim.u('uWaveAmp[0]'),ampArr);
+    attrib(0,bTri,2);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    gGalFlip=!gGalFlip;
+  }
+
+  /* ================= 轮廓骨架模拟 ================= */
+  {
+    const wF=skFlip?fSkA:fSkB;
+    const rP2=skFlip?skPosB:skPosA, rV2=skFlip?skVelB:skVelA;
+    gl.bindFramebuffer(gl.FRAMEBUFFER,wF);
+    gl.viewport(0,0,SK_N,SK_N);
+    gl.useProgram(pSkSim);
+    gl.uniform1i(pSkSim.u('uPos'),0); gl.uniform1i(pSkSim.u('uVel'),1);
+    gl.uniform1i(pSkSim.u('uTgt'),2); gl.uniform1i(pSkSim.u('uTan'),3);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,rP2);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,rV2);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,skTgt);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D,skTan);
+    gl.uniform1f(pSkSim.u('uDt'),dt);
+    gl.uniform1f(pSkSim.u('uTime'),simTime);
+    gl.uniform1f(pSkSim.u('uScale'),hScale);
+    gl.uniform1f(pSkSim.u('uCharge'),chargeAmt);
+    gl.uniform1f(pSkSim.u('uBurst'),burstK);
+    gl.uniform1f(pSkSim.u('uReel'),reelAmt);
+    attrib(0,bTri,2);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    skFlip=!skFlip;
+  }
+
+  /* ================= 粒子模拟 ================= */
+  gl.bindFramebuffer(gl.FRAMEBUFFER,simFlip?fboSimA:fboSimB);
+  const rPos=simFlip?texPosB:texPosA, rVel=simFlip?texVelB:texVelA;
+  gl.viewport(0,0,SIM_N,SIM_N);
+  gl.useProgram(pSim); gSetConsts(pSim);
+  gl.uniform1i(pSim.u('uPos'),0); gl.uniform1i(pSim.u('uVel'),1); gl.uniform1i(pSim.u('uGridVel'),2);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,rPos);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,rVel);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,wV);
+  gl.uniform1f(pSim.u('uDt'),dt);
+  gl.uniform1f(pSim.u('uTime'),simTime);
+  gl.uniform1f(pSim.u('uSeedF'),seedF);
+  gl.uniform1f(pSim.u('uAttract'),env(E.attract,bt));
+  gl.uniform1f(pSim.u('uScale'),hScale);
+  gl.uniform1f(pSim.u('uTurb'),env(E.turb,bt));
+  gl.uniform1f(pSim.u('uBurst'),burstV);
+  gl.uniform3fv(pSim.u('uPointer'),mouse.on?mouse.ptr:[9,9,9]);
+  gl.uniform3fv(pSim.u('uPointerVel'),mouse.vel);
+  gl.uniform3fv(pSim.u('uCamDir'),fw);
+  gl.uniform1f(pSim.u('uPtrOn'),mouse.on?1:0);
+  gl.uniform1f(pSim.u('uPtrDown'),mouse.down?1:0);
+  gl.uniform1f(pSim.u('uEntrain'),mouse.on?Math.min(Math.hypot(...mouse.vel),4)*0.25:0);
+  gl.uniform4fv(pSim.u('uWaves[0]'),waveArr);
+  gl.uniform1fv(pSim.u('uWaveAmp[0]'),ampArr);
+  attrib(0,bTri,2);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  simFlip=!simFlip;
+  const curPos=simFlip?texPosA:texPosB;
+  const curVel=simFlip?texVelA:texVelB;
+
+  /* ================= 场景渲染 ================= */
+  const dst=accFlip?fboAccB:fboAccA, dstTex=accFlip?accB:accA, src=accFlip?accA:accB;
+  accFlip=!accFlip;
+  gl.bindFramebuffer(gl.FRAMEBUFFER,dst);
+  gl.viewport(0,0,W,H);
+
+  gl.useProgram(pFade);
+  gl.uniform1i(pFade.u('uPrev'),0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,src);
+  gl.uniform1f(pFade.u('uDecay'),0.85);
+  attrib(0,bTri,2);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE,gl.ONE);
+
+  /* ======== 粒子银河三通道 ======== */
+  const curGP=gGalFlip?gPosA:gPosB;
+  {
+    const hw=tf(VP,[0,0.05,0]);
+    const hnx=hw[0]/hw[3], hny=hw[1]/hw[3];
+    const hr=1.32*hScale/Math.hypot(...sub3([0,0.05,0],camP))*focalY;
+    /* 点精灵 */
+    gl.useProgram(pGalPts); gSetConsts(pGalPts);
+    gl.uniform1i(pGalPts.u('uOA'),0); gl.uniform1i(pGalPts.u('uOB'),1);
+    gl.uniform1i(pGalPts.u('uOC'),2); gl.uniform1i(pGalPts.u('uGP'),3);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gOA);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gOB);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,gOC);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D,curGP);
+    gl.uniformMatrix4fv(pGalPts.u('uVP'),false,VP);
+    gl.uniform3fv(pGalPts.u('uCamPos'),camP);
+    gl.uniform1i(pGalPts.u('uN'),GN2);
+    gl.uniform1f(pGalPts.u('uTime'),simTime);
+    gl.uniform1f(pGalPts.u('uFocus'),cam.dist);
+    gl.uniform1f(pGalPts.u('uAspectTanInv'),H*focalY);
+    gl.uniform1f(pGalPts.u('uAspect'),W/H);
+    gl.uniform1f(pGalPts.u('uCoreEnv'),env(E.core,bt));
+    gl.uniform1f(pGalPts.u('uEnergyTint'),burstK);
+    gl.uniform3f(pGalPts.u('uHeartScr'),hnx,hny,hr*0.5);
+    attrib(0,bufGalIdx,1);
+    gl.drawArrays(gl.POINTS,0,GCOUNT);
+    /* 短拖尾 */
+    gl.useProgram(pGalStr);
+    gl.uniform1i(pGalStr.u('uOA'),0); gl.uniform1i(pGalStr.u('uOB'),1);
+    gl.uniform1i(pGalStr.u('uGP'),2);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gOA);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gOB);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,curGP);
+    gl.uniformMatrix4fv(pGalStr.u('uVP'),false,VP);
+    gl.uniform1i(pGalStr.u('uN'),GN2);
+    gl.uniform1f(pGalStr.u('uTime'),simTime);
+    attrib(0,bufGalIdx,2);
+    gl.drawArrays(gl.LINES,0,GCOUNT);
+    /* 流体丝线 */
+    gl.useProgram(pGalFil);
+    gl.uniform1i(pGalFil.u('uOA'),0); gl.uniform1i(pGalFil.u('uOB'),1);
+    gl.uniform1i(pGalFil.u('uGP'),2);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,gOA);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,gOB);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,curGP);
+    gl.uniformMatrix4fv(pGalFil.u('uVP'),false,VP);
+    gl.uniform1i(pGalFil.u('uN'),GN2);
+    gl.uniform1f(pGalFil.u('uTime'),simTime);
+    attrib(0,bufGalFil,2);
+    gl.drawArrays(gl.LINES,0,GAL_TRAILS);
+  }
+
+  /* 主粒子云 */
+  gl.useProgram(pPts); gSetConsts(pPts);
+  gl.uniform1i(pPts.u('uPos'),0); gl.uniform1i(pPts.u('uVel'),1); gl.uniform1i(pPts.u('uGridCurl'),2);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,curPos);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,curVel);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,gCurl);
+  gl.uniformMatrix4fv(pPts.u('uVP'),false,VP);
+  gl.uniform3fv(pPts.u('uCamPos'),camP);
+  gl.uniform1i(pPts.u('uN'),SIM_N);
+  gl.uniform1f(pPts.u('uTime'),simTime);
+  gl.uniform1f(pPts.u('uFocus'),cam.dist);
+  gl.uniform1f(pPts.u('uPtBase'),0.015);
+  gl.uniform1f(pPts.u('uHScale'),hScale);
+  gl.uniform1f(pPts.u('uAspectTanInv'),H*focalY);
+  attrib(0,bufIdx,1);
+  gl.drawArrays(gl.POINTS,0,COUNT);
+
+  /* 拖尾 */
+  gl.useProgram(pStreak);
+  gl.uniform1i(pStreak.u('uPos'),0); gl.uniform1i(pStreak.u('uVel'),1);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,curPos);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,curVel);
+  gl.uniformMatrix4fv(pStreak.u('uVP'),false,VP);
+  gl.uniform1f(pStreak.u('uTime'),simTime);
+  gl.uniform1i(pStreak.u('uN'),SIM_N);
+  attrib(0,bufStreak,2);
+  gl.drawArrays(gl.LINES,0,STREAK_LINES*2);
+
+  /* 电弧 */
+  gl.useProgram(pArc);
+  gl.uniform1i(pArc.u('uPos'),0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,curPos);
+  gl.uniformMatrix4fv(pArc.u('uVP'),false,VP);
+  gl.uniform1f(pArc.u('uTime'),simTime);
+  gl.uniform1i(pArc.u('uN'),SIM_N);
+  attrib(0,bufArc,2);
+  gl.drawArrays(gl.LINES,0,ARC_SEGS*2);
+
+  /* 三维轮廓骨架（最亮层）*/
+  gl.useProgram(pSkPts);
+  gl.uniform1i(pSkPts.u('uPos'),0); gl.uniform1i(pSkPts.u('uTgt'),1); gl.uniform1i(pSkPts.u('uTan'),2);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,skFlip?skPosA:skPosB);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,skTgt);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D,skTan);
+  gl.uniformMatrix4fv(pSkPts.u('uVP'),false,VP);
+  gl.uniform3fv(pSkPts.u('uCamPos'),camP);
+  gl.uniform1i(pSkPts.u('uN'),SK_N);
+  gl.uniform1f(pSkPts.u('uTime'),simTime);
+  gl.uniform1f(pSkPts.u('uPtScale'),H*focalY*0.004);
+  gl.uniform1f(pSkPts.u('uGlow'),0.85+env(E.core,bt)*0.16+flash*0.25);
+  attrib(0,bufSkIdx,1);
+  gl.drawArrays(gl.POINTS,0,SK_COUNT);
+
+
+  /* 能量核心 */
+  gl.useProgram(pCore);
+  gl.uniformMatrix4fv(pCore.u('uVP'),false,VP);
+  gl.uniform3f(pCore.u('uCenter'),0,0.05,0);
+  const coreDist=Math.hypot(...sub3([0,0.05,0],camP));
+  const coreR=0.46/coreDist*focalY*0.5;   /* 核心恢复存在感 */
+  gl.uniform2f(pCore.u('uNdcR'),coreR*H/W,coreR);
+  gl.uniform1f(pCore.u('uTime'),simTime);
+  gl.uniform1f(pCore.u('uCore'),env(E.core,bt));
+  gl.uniform1f(pCore.u('uFlash'),flash);
+  attrib(0,bQuad,2);
+  gl.drawArrays(gl.TRIANGLES,0,6);
+
+  /* 指针环：零延迟钉住光标原始射线交点 */
+  if(mouse.on){
+    const ex=pointerWorld();
+    const pl=tf(VP,[...ex,1]);
+    if(pl[3]>0.01){
+      gl.useProgram(pPtr);
+      gl.uniformMatrix4fv(pPtr.u('uVP'),false,VP);
+      gl.uniform3fv(pPtr.u('uCenter'),ex);
+      const pr=0.55/Math.hypot(...sub3(ex,camP))*focalY*0.5;   /* 光球缩小 */
+      gl.uniform2f(pPtr.u('uNdcR'),pr*H/W,pr);
+      gl.uniform1f(pPtr.u('uDown'),mouse.down?1:0);
+      gl.uniform1f(pPtr.u('uOn'),1);
+      attrib(0,bQuad,2);
+      gl.drawArrays(gl.TRIANGLES,0,6);
+    }
+  }
+
+  /* ================= 辉光链 ================= */
+  gl.disable(gl.BLEND);
+  const bw=Math.max(2,W>>2), bh=Math.max(2,H>>2);
+  gl.useProgram(pBr);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fboBA);
+  gl.viewport(0,0,bw,bh);
+  gl.uniform1i(pBr.u('uSrc'),0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,dstTex);
+  gl.uniform2f(pBr.u('uTexel'),1/W,1/H);
+  attrib(0,bTri,2);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+
+  gl.useProgram(pBlur);
+  gl.uniform1i(pBlur.u('uSrc'),0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fboBB);
+  gl.viewport(0,0,bw,bh);
+  gl.bindTexture(gl.TEXTURE_2D,bloomA);
+  gl.uniform2f(pBlur.u('uDir'),1/bw,0);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fboBA);
+  gl.viewport(0,0,bw,bh);
+  gl.bindTexture(gl.TEXTURE_2D,bloomB);
+  gl.uniform2f(pBlur.u('uDir'),0,1/bh);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+
+  /* ================= 合成 ================= */
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  gl.viewport(0,0,W,H);
+  gl.useProgram(pComp);
+  gl.uniform1i(pComp.u('uScene'),0);
+  gl.uniform1i(pComp.u('uBloom'),1);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,dstTex);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,bloomA);
+  gl.uniform1f(pComp.u('uTime'),simTime);
+  gl.uniform1f(pComp.u('uAspect'),W/H);
+  gl.uniform4fv(pComp.u('uWaveScr[0]'),waveScr);
+  gl.uniform1f(pComp.u('uFlash'),flash);
+  attrib(0,bTri,2);
+  gl.drawArrays(gl.TRIANGLES,0,3);
+
+  requestAnimationFrame(frame);
+}
+
+/* ============================================================ 交互 */
+canvas.addEventListener('mousemove',e=>{
+  mouse.nx=(e.clientX/innerWidth)*2-1;
+  mouse.ny=-((e.clientY/innerHeight)*2-1);
+  mouse.on=true;
+  /* 拖拽轨道旋转 */
+  if(dragState.on){
+    const dx=e.clientX-dragState.lx, dy=e.clientY-dragState.ly;
+    dragState.cx+=Math.abs(dx)+Math.abs(dy);
+    if(dragState.cx>6) dragState.moved=true;
+    const instYaw=-dx*0.005, instPitch=dy*0.004;   /* 水平：场景跟手；垂直：俯仰已验证正确 */
+    dragState.yaw+=instYaw;
+    dragState.pitch=Math.min(1.15,Math.max(-0.85,dragState.pitch+instPitch));
+    dragState.vyaw+=(instYaw/Math.max(gDt,1e-3)-dragState.vyaw)*0.25;
+    dragState.vpitch+=(instPitch/Math.max(gDt,1e-3)-dragState.vpitch)*0.25;
+    dragState.lx=e.clientX; dragState.ly=e.clientY;
+  }
+});
+canvas.addEventListener('mouseleave',()=>{ mouse.on=false; });
+canvas.addEventListener('mousedown',e=>{
+  mouse.down=true; mouse.on=true;
+  mouse.nx=(e.clientX/innerWidth)*2-1;
+  mouse.ny=-((e.clientY/innerHeight)*2-1);
+  /* 记录拖拽起点；松手时区分「点击冲击波」与「拖拽旋转」*/
+  dragState.on=true; dragState.moved=false;
+  dragState.lx=e.clientX; dragState.ly=e.clientY; dragState.t0=performance.now();
+  dragState.cx=0; dragState.vyaw=0; dragState.vpitch=0;
+  const pw=pointerWorld();
+  mouse.ptrT=pw; mouse.vel=[0,0,0]; mouse.init=true;
+});
+window.addEventListener('mouseup',e=>{
+  mouse.down=false;
+  if(dragState.on){
+    dragState.on=false;
+    if(!dragState.moved && performance.now()-dragState.t0<400){
+      mouse.nx=(e.clientX/innerWidth)*2-1;
+      mouse.ny=-((e.clientY/innerHeight)*2-1);
+      spawnWave(pointerWorld(),3.4);
+      flash=Math.min(flash+0.55,1.6);
+    }
+  }
+});
+canvas.addEventListener('touchstart',e=>{
+  const t=e.touches[0];
+  mouse.nx=(t.clientX/innerWidth)*2-1;
+  mouse.ny=-((t.clientY/innerHeight)*2-1);
+  mouse.on=true; mouse.down=true;
+  if(e.touches.length===1){
+    dragState.on=true; dragState.moved=false;
+    dragState.lx=t.clientX; dragState.ly=t.clientY; dragState.t0=performance.now();
+    dragState.cx=0; dragState.vyaw=0; dragState.vpitch=0;
+    const pw=pointerWorld();
+    mouse.ptrT=pw; mouse.vel=[0,0,0]; mouse.init=true;
+  } else if(e.touches.length===2){
+    dragState.on=false;
+    dragState.pinch=Math.hypot(
+      e.touches[0].clientX-e.touches[1].clientX,
+      e.touches[0].clientY-e.touches[1].clientY);
+  }
+  e.preventDefault();
+},{passive:false});
+canvas.addEventListener('touchmove',e=>{
+  e.preventDefault();
+  if(e.touches.length===2){
+    /* 双指捏合缩放 */
+    const d=Math.hypot(
+      e.touches[0].clientX-e.touches[1].clientX,
+      e.touches[0].clientY-e.touches[1].clientY);
+    if(dragState.pinch>10) zoomTarget=Math.min(6.5,Math.max(2.6,zoomTarget*dragState.pinch/d));
+    dragState.pinch=d;
+    return;
+  }
+  const t=e.touches[0];
+  mouse.nx=(t.clientX/innerWidth)*2-1;
+  mouse.ny=-((t.clientY/innerHeight)*2-1);
+  mouse.on=true;
+  if(dragState.on){
+    const dx=t.clientX-dragState.lx, dy=t.clientY-dragState.ly;
+    dragState.cx+=Math.abs(dx)+Math.abs(dy);
+    if(dragState.cx>8) dragState.moved=true;
+    dragState.yaw-=dx*0.005;
+    dragState.pitch=Math.min(1.15,Math.max(-0.85,dragState.pitch+dy*0.004));
+    dragState.lx=t.clientX; dragState.ly=t.clientY;
+  }
+},{passive:false});
+window.addEventListener('touchend',e=>{
+  mouse.down=false;
+  if(dragState.on){
+    dragState.on=false;
+    if(!dragState.moved && performance.now()-dragState.t0<300){
+      spawnWave(pointerWorld(),3.4);
+      flash=Math.min(flash+0.55,1.6);
+    }
+  }
+});
+window.addEventListener('pointercancel',()=>{ mouse.down=false; });
+canvas.addEventListener('webglcontextlost',e=>{
+  e.preventDefault(); running=false;
+  const el=document.querySelector('#err'); el.style.display='flex';
+  el.textContent='图形上下文丢失，正在重新加载…';
+  setTimeout(()=>location.reload(),900);
+});
+let rsTimer=null;
+window.addEventListener('resize',()=>{
+  clearTimeout(rsTimer); rsTimer=setTimeout(resize,150);
+});
+window.addEventListener('wheel',e=>{
+  e.preventDefault();
+  zoomTarget=Math.min(6.5,Math.max(2.6,zoomTarget*Math.exp(e.deltaY*0.001)));
+},{passive:false});
+document.addEventListener('visibilitychange',()=>{
+  running=!document.hidden;
+});
+
+/* ============================================================ 启动 */
+buildParticles(STAGES[0].grid);
+resize();
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
