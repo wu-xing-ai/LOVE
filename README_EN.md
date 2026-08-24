@@ -1,5 +1,7 @@
 # ♥ Heart · A Living Body of Light
 
+**English** | [中文](README.md)
+
 **A Real-Time Particle Universe — Built Around a Beating Heart**
 
 A crimson energy heart made of 170,000 fluid particles, wrapped in rings of stars on Keplerian orbits.

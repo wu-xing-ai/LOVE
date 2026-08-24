@@ -1,6 +1,8 @@
 # ♥ 心 · 光之生命体
 
-**A Living Heart of Light — Real-Time Particle Universe**
+[English](README_EN.md) | **中文**
+
+**一颗由 17 万流体粒子构成的能量心体，被一圈圈开普勒轨道的星河包裹。**
 
 一颗由 17 万流体粒子构成的能量心体，被一圈圈开普勒轨道的星河包裹。
 
